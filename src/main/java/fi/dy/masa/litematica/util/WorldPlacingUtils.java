@@ -496,7 +496,7 @@ public class WorldPlacingUtils
 
             if (entity instanceof Display || entity instanceof Leashable)
             {
-                entity.tick(); // Required to set the full data for rendering
+                tickOnceInPlace(entity); // Required to set the full data for rendering
             }
 
             // TODO -- doesn't work
@@ -527,6 +527,65 @@ public class WorldPlacingUtils
 //                    }
 //                }
 //            }
+        }
+    }
+
+    /**
+     * Ticks the entity once (some entities need it for their render data), but keeps it exactly where it was.
+     * The schematic world never ticks entities, so if the tick moved it (gravity, AI, etc.), the renderer
+     * would interpolate between the old and the new position/rotation forever, making it jitter.
+     */
+    public static void tickOnceInPlace(Entity entity)
+    {
+        final double x = entity.getX();
+        final double y = entity.getY();
+        final double z = entity.getZ();
+        final float yaw = entity.getYRot();
+        final float pitch = entity.getXRot();
+        float bodyYaw = 0f;
+        float headYaw = 0f;
+
+        if (entity instanceof LivingEntity living)
+        {
+            bodyYaw = living.yBodyRot;
+            headYaw = living.yHeadRot;
+        }
+
+        entity.tick();
+
+        entity.setDeltaMovement(Vec3.ZERO);
+        entity.snapTo(x, y, z, yaw, pitch);
+        entity.setOldPosAndRot();
+
+        if (entity instanceof LivingEntity living)
+        {
+            living.yBodyRot = bodyYaw;
+            living.yBodyRotO = bodyYaw;
+            living.yHeadRot = headYaw;
+            living.yHeadRotO = headYaw;
+            living.walkAnimation.stop();
+        }
+
+        // Passengers (for example mobs in a boat) got moved along by the tick;
+        // put them back onto the (restored) vehicle, and make their old position match too.
+        for (Entity passenger : entity.getIndirectPassengers())
+        {
+            Entity vehicle = passenger.getVehicle();
+
+            if (vehicle != null)
+            {
+                vehicle.positionRider(passenger);
+            }
+
+            passenger.setDeltaMovement(Vec3.ZERO);
+            passenger.setOldPosAndRot();
+
+            if (passenger instanceof LivingEntity living)
+            {
+                living.yBodyRotO = living.yBodyRot;
+                living.yHeadRotO = living.yHeadRot;
+                living.walkAnimation.stop();
+            }
         }
     }
 

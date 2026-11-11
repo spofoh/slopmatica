@@ -115,6 +115,28 @@ public class PlacementManagerTaskRebuild extends PlacementManagerTask
 				// since it may have been requested for a newer placement state.
 
 				worldSchematic.scheduleChunkRenders(this.cx(), this.cz());
+
+				// The meshes of the neighboring chunks depend on this chunk's blocks at the borders
+				// (fluid surfaces/heights, face culling, AO). If they were already built against the old
+				// contents of this chunk (for example while moving a placement), rebuild them too,
+				// otherwise there are "walls" in water at the chunk borders.
+				// Neighbors that still have their own rebuild pending will be meshed after that anyway.
+				for (int dx = -1; dx <= 1; dx++)
+				{
+					for (int dz = -1; dz <= 1; dz++)
+					{
+						int nx = this.cx() + dx;
+						int nz = this.cz() + dz;
+
+						if ((dx != 0 || dz != 0) &&
+							worldSchematic.getChunkSource().hasChunk(nx, nz) &&
+							!PlacementManagerDaemonHandler.INSTANCE.hasAnyRebuildTasksFor(nx, nz))
+						{
+							worldSchematic.scheduleChunkRenders(nx, nz);
+						}
+					}
+				}
+
 				manager.setVisibleSubChunksNeedsUpdate();
 			}
 		};

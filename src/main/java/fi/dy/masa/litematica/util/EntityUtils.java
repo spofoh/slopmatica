@@ -483,6 +483,16 @@ public class EntityUtils
                 setEntityRotations(passenger, passenger.getYRot(), passenger.getXRot());
                 spawnEntityAndPassengersInWorld(passenger, world);
                 entity.positionRider(passenger);
+
+                // The schematic world never ticks entities; without this the renderer would
+                // interpolate between the old and the new (riding) position forever (jittering passengers)
+                passenger.setOldPosAndRot();
+
+                if (passenger instanceof LivingEntity living)
+                {
+                    living.yBodyRotO = living.yBodyRot;
+                    living.yHeadRotO = living.yHeadRot;
+                }
             }
         }
     }

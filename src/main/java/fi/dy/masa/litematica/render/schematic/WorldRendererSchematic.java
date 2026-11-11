@@ -1374,6 +1374,13 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
                     continue;
                 }
 
+                // Move preview: draw the entities shifted along with the chunk mesh, as long as the
+                // chunk still has the contents the mesh was built from
+                final BlockPos ghostShift = chunkRenderer.isGhost() &&
+                                            chunkRenderer.getChunkRenderData().getTimeBuilt() >= chunk.getTimeCreated()
+                                            ? this.getGhostShift(chunkRenderer) : null;
+                final int firstStateIndex = this.getSchematicRenderState().entityStates.size();
+
 //                List<Entity> list = chunk.getEntityList();
                 AABB bb = chunkRenderer.getBoundingBox();
 //                List<Entity> list = this.world.getEntities((Entity) null, bb, fi.dy.masa.litematica.util.EntityUtils.NOT_PLAYER);
@@ -1462,6 +1469,11 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
                         shouldRender = true;
                         // Still half broken.
                     }
+                    else if (ghostShift != null)
+                    {
+                        // The frustum check would use the unshifted position
+                        shouldRender = true;
+                    }
                     else
                     {
                         shouldRender = ((IEntityRendererInvoker) this.getEntityRenderer()).litematica_shouldRender(entityTmp, frustum, cameraX, cameraY, cameraZ);
@@ -1499,6 +1511,23 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
 //                    {
 //                        LOGGER.warn("Skipping Entity at pos X: [{}], Y: [{}], Z: [{}] (Should Render = False)", entityTmp.getX(), entityTmp.getY(), entityTmp.getZ());
 //                    }
+                }
+
+                if (ghostShift != null)
+                {
+                    List<EntityRenderState> states = this.getSchematicRenderState().entityStates;
+
+                    for (int i = firstStateIndex; i < states.size(); i++)
+                    {
+                        EntityRenderState state = states.get(i);
+
+                        if (state != null)
+                        {
+                            state.x += ghostShift.getX();
+                            state.y += ghostShift.getY();
+                            state.z += ghostShift.getZ();
+                        }
+                    }
                 }
             }
 
@@ -1552,12 +1581,6 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
         profiler.popPush("block_entities_iteration");
         for (ChunkRendererSchematicVbo chunkRenderer : this.renderInfos)
         {
-            // Block entities aren't shifted during a move preview
-            if (chunkRenderer.isGhost())
-            {
-                continue;
-            }
-
             final ChunkPos chunkPos = chunkRenderer.getChunkPos();
             ChunkSchematic chunk = this.world.getChunkSource().getChunkForLighting(chunkPos.x(), chunkPos.z());
 
@@ -1571,6 +1594,8 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
 
             if (chunk.getState().atLeast(ChunkSchematicState.LOADED) && data.getTimeBuilt() >= chunk.getTimeCreated())
             {
+                // Move preview: shifted along with the chunk mesh
+                final BlockPos ghostShift = chunkRenderer.isGhost() ? this.getGhostShift(chunkRenderer) : null;
                 final ChunkMeshDataSchematic chunkMeshData = data.getMeshDataCache();
                 List<BlockEntity> tiles = chunkMeshData.getBlockEntities();
                 List<BlockEntity> noCullTiles = chunkMeshData.getNoCullBlockEntities();
@@ -1589,7 +1614,14 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
                         }
 
                         // Skip the ones outside of the view (the vanilla renderer culls these too)
-                        if (!frustum.isVisible(new AABB(pos).inflate(1.0)))
+                        AABB teBox = new AABB(pos).inflate(1.0);
+
+                        if (ghostShift != null)
+                        {
+                            teBox = teBox.move(ghostShift.getX(), ghostShift.getY(), ghostShift.getZ());
+                        }
+
+                        if (!frustum.isVisible(teBox))
                         {
                             continue;
                         }
@@ -1601,6 +1633,12 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
                             matrices.pushPose();
                             matrices.translate(pos.getX() - cameraX, pos.getY() - cameraY, pos.getZ() - cameraZ);
                             BlockEntityRenderState state = this.getBlockEntityRenderer().tryExtractRenderState(te, tickProgress, null, false);
+
+                            if (state != null && ghostShift != null)
+                            {
+                                state.blockPos = state.blockPos.offset(ghostShift);
+                            }
+
                             this.getSchematicRenderState().blockEntityStates.add(state);
                             // Ignore crumbling, because there is no point in the Schem World.
                             matrices.popPose();
@@ -1630,6 +1668,12 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
                             matrices.pushPose();
                             matrices.translate(pos.getX() - cameraX, pos.getY() - cameraY, pos.getZ() - cameraZ);
                             BlockEntityRenderState state = this.getBlockEntityRenderer().tryExtractRenderState(te, tickProgress, null, true);
+
+                            if (state != null && ghostShift != null)
+                            {
+                                state.blockPos = state.blockPos.offset(ghostShift);
+                            }
+
                             this.getSchematicRenderState().blockEntityStates.add(state);
                             // Ignore crumbling, because there is no point in the Schem World.
                             matrices.popPose();

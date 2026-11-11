@@ -601,7 +601,7 @@ public class SchematicPlacingUtils
 
                     if (entity instanceof Display || entity instanceof Leashable)
                     {
-                        entity.tick(); // Required to set the full data for rendering
+                        WorldPlacingUtils.tickOnceInPlace(entity); // Required to set the full data for rendering
                     }
                 }
             }
