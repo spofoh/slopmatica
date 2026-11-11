@@ -723,6 +723,8 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
 //        }
 //    }
 
+    private static final ChunkSectionLayer[] LAYERS = ChunkSectionLayer.values();
+
     @Override
     public int prepareBlockLayers(Matrix4fc matrix4fc,
                                    double cameraX, double cameraY, double cameraZ,
@@ -784,10 +786,8 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
 //            long now = System.currentTimeMillis();
 //            int uboIndex = -1;
 
-            for (ChunkSectionLayer layer : ChunkSectionLayer.values())
+            for (ChunkSectionLayer layer : LAYERS)
             {
-                profiler.popPush("layer_"+ layer.label());
-
                 if (!data.isBlockLayerEmpty(layer))
                 {
                     ChunkRenderGpuBuffers buffers = gpuUploader.buffersOrNull(layer);
@@ -1063,9 +1063,22 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
         boolean renderThrough = Configs.Visuals.SCHEMATIC_OVERLAY_RENDER_THROUGH.getBooleanValue() || Hotkeys.RENDER_OVERLAY_THROUGH_BLOCKS.getKeybind().isKeybindHeld();
         RenderPipeline pipeline = renderThrough ? type.renderThrough() : type.pipeline();
 
-        float[] offset = new float[]{0.3f, 0.0f, 0.6f};
+        if (!RenderSystem.isOnRenderThread())
+        {
+            profiler.pop();
+            return;
+        }
 
-        Matrix4fStack matrix4fStack = RenderSystem.getModelViewStack();
+        // All the chunks get drawn in one render pass (one draw per chunk), instead of
+        // creating a separate render pass for every chunk, which got very slow with big schematics.
+        Matrix4fc modelView = RenderSystem.getModelViewMatrixCopy();
+        Vector4fc colorMod = new Vector4f(1f, 1f, 1f, 1f);
+        Vector3fc noOffset = new Vector3f();
+        Matrix4fc texMatrix = new Matrix4f();
+        List<DynamicGpuData.Transform> transforms = new ArrayList<>();
+        List<RenderPass.Draw<GpuBufferSlice[]>> draws = new ArrayList<>();
+        final BlockPos.MutableBlockPos chunkOrigin = new BlockPos.MutableBlockPos();
+        int maxSequentialIndices = 0;
 
         profiler.popPush("overlay_iterate");
         this.profiler = profiler;
@@ -1074,30 +1087,62 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
         {
             ChunkRendererSchematicVbo renderer = this.renderInfos.get(i);
 
-            if (!renderer.getChunkRenderData().isEmpty() && renderer.hasOverlay())
+            if (!renderer.hasOverlay())
             {
-                final ChunkRenderDataSchematic compiledChunk = renderer.getChunkRenderData();
-                final ChunkMeshDataSchematic chunkMeshData = compiledChunk.getMeshDataCache();
-                final BlockPos.MutableBlockPos chunkOrigin = new BlockPos.MutableBlockPos();
-                this.offsetForGhost(renderer, chunkOrigin);
-                final ChunkPos cp = renderer.getChunkPos();
-                ChunkRenderGpuUploader gpuUploader = this.chunkRendererGpuDispatcher.addOrGetUploader(cp.x(), cp.z());
+                continue;
+            }
 
-                if (!compiledChunk.isOverlayTypeEmpty(type))
-                {
-                    ChunkRenderGpuBuffers buffers = gpuUploader.buffersOrNull(type);
+            final ChunkRenderDataSchematic compiledChunk = renderer.getChunkRenderData();
 
-                    if (buffers == null || buffers.isClosed() || !chunkMeshData.hasMeshData(type))
-                    {
-//                        LOGGER.error("Overlay [{}], ChunkOrigin [{}], NO BUFFERS", type.name(), chunkOrigin.toShortString());
-                        continue;
-                    }
+            if (compiledChunk.isEmpty() || compiledChunk.isOverlayTypeEmpty(type))
+            {
+                continue;
+            }
 
-                    matrix4fStack.pushMatrix();
-                    matrix4fStack.translate((float) (chunkOrigin.getX() - x), (float) (chunkOrigin.getY() - y), (float) (chunkOrigin.getZ() - z));
-                    this.drawOverlayInternal(type, pipeline, buffers, -1, offset, false, false);
-                    matrix4fStack.popMatrix();
-                }
+            final ChunkMeshDataSchematic chunkMeshData = compiledChunk.getMeshDataCache();
+            final ChunkPos cp = renderer.getChunkPos();
+            ChunkRenderGpuUploader gpuUploader = this.chunkRendererGpuDispatcher.addOrGetUploader(cp.x(), cp.z());
+            ChunkRenderGpuBuffers buffers = gpuUploader.buffersOrNull(type);
+
+            if (buffers == null || buffers.isClosed() || !chunkMeshData.hasMeshData(type) || buffers.getIndexCount() <= 0)
+            {
+                continue;
+            }
+
+            this.offsetForGhost(renderer, chunkOrigin);
+            GpuBuffer indexBuffer = buffers.getIndexBuffer();
+            IndexType indexType = indexBuffer != null ? buffers.getIndexType() : null;
+
+            if (indexBuffer == null)
+            {
+                maxSequentialIndices = Math.max(maxSequentialIndices, buffers.getIndexCount());
+            }
+
+            Matrix4f matrix = new Matrix4f(modelView).translate((float) (chunkOrigin.getX() - x), (float) (chunkOrigin.getY() - y), (float) (chunkOrigin.getZ() - z));
+            final int index = transforms.size();
+            transforms.add(new DynamicGpuData.Transform(matrix, colorMod, noOffset, texMatrix));
+            draws.add(new RenderPass.Draw<>(0, buffers.getVertexBuffer(), indexBuffer, indexType, 0, buffers.getIndexCount(), 0,
+                                            (slices, uploader) -> uploader.setUniform("DynamicTransforms", ((GpuBufferSlice[]) slices)[index])));
+        }
+
+        if (!draws.isEmpty())
+        {
+            profiler.popPush("overlay_draw");
+            GpuBufferSlice[] slices = RenderSystem.getDynamicUniforms().writeTransforms(transforms.toArray(new DynamicGpuData.Transform[0]));
+            RenderSystem.AutoStorageIndexBuffer sequential = RenderSystem.getSequentialBuffer(type.topology());
+            GpuBuffer defaultIndexBuffer = maxSequentialIndices > 0 ? sequential.getBuffer(maxSequentialIndices) : null;
+            IndexType defaultIndexType = maxSequentialIndices > 0 ? sequential.type() : null;
+            RenderTarget mainFb = RenderUtils.mainTarget();
+
+            try (RenderPass pass = RenderSystem.getDevice()
+                                               .createCommandEncoder()
+                                               .createRenderPass(() -> "litematica:schematic_overlay/" + type.name(),
+                                                                 mainFb.getColorTextureView(), Optional.empty(),
+                                                                 mainFb.hasDepth() ? mainFb.getDepthTextureView() : null, OptionalDouble.empty()))
+            {
+                pass.setPipeline(RenderSystem.getCompiledPipeline(pipeline));
+                RenderSystem.bindDefaultUniforms(pass);
+                pass.drawMultipleIndexed(draws, defaultIndexBuffer, defaultIndexType, List.of("DynamicTransforms"), slices);
             }
         }
 
@@ -1312,6 +1357,12 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
 
             for (ChunkRendererSchematicVbo chunkRenderer : this.renderInfos)
             {
+                // No entities in the schematic world, don't look them up for every chunk every frame
+                if (this.countEntitiesTotal <= 0)
+                {
+                    break;
+                }
+
                 BlockPos pos = chunkRenderer.getOrigin();
                 ChunkPos chunkPos = chunkRenderer.getChunkPos();
 //                ChunkPos chunkPos = new ChunkPos(pos.getX() >> 4, pos.getZ() >> 4);
@@ -1533,6 +1584,12 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
                         BlockPos pos = te.getBlockPos();
 
                         if (!layerRange.isPositionWithinRange(pos.getX(), pos.getY(), pos.getZ()))
+                        {
+                            continue;
+                        }
+
+                        // Skip the ones outside of the view (the vanilla renderer culls these too)
+                        if (!frustum.isVisible(new AABB(pos).inflate(1.0)))
                         {
                             continue;
                         }
