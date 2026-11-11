@@ -1,10 +1,12 @@
 package fi.dy.masa.litematica.render.schematic;
 
+import java.util.EnumSet;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
 import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 import com.google.common.collect.Lists;
 import com.google.common.primitives.Doubles;
 import org.apache.logging.log4j.Logger;
@@ -13,6 +15,7 @@ import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.phys.Vec3;
 
 import fi.dy.masa.litematica.Litematica;
+import fi.dy.masa.litematica.schematic.placement.SchematicPlacementManager;
 
 public class ChunkRenderTaskSchematic implements Comparable<ChunkRenderTaskSchematic>
 {
@@ -24,12 +27,18 @@ public class ChunkRenderTaskSchematic implements Comparable<ChunkRenderTaskSchem
     private final ReentrantLock lock;
     private final Supplier<Vec3> cameraPosSupplier;
     private final double distanceSq;
-    private ChunkRenderTaskSchematic.Status status;
-    private boolean finished;
+    private final long createdNanos;
+    private volatile ChunkRenderTaskSchematic.Status status;
+    private volatile boolean finished;
+    // The result of a rebuild; private to this task until it's swapped in on the render thread
+    @Nullable private volatile ChunkRenderDataSchematic compiledData;
+    private final EnumSet<OverlayRenderType> builtOverlays = EnumSet.noneOf(OverlayRenderType.class);
+    @Nullable private volatile SchematicPlacementManager.ChunkContent builtContent;
 
     public ChunkRenderTaskSchematic(@Nonnull ChunkRendererSchematicVbo renderChunkIn, ChunkRenderTaskSchematic.Type typeIn, Supplier<Vec3> cameraPosSupplier, double distanceSqIn)
     {
         this.type = typeIn;
+        this.createdNanos = System.nanoTime();
 		this.listFinishRunnables = Lists.newArrayList();
 	    this.lock = new ReentrantLock();
         this.cameraPosSupplier = cameraPosSupplier;
@@ -55,8 +64,47 @@ public class ChunkRenderTaskSchematic implements Comparable<ChunkRenderTaskSchem
         return this.chunkRenderer.get();
     }
 
+    protected long getCreatedNanos()
+    {
+        return this.createdNanos;
+    }
+
+    protected void setCompiledData(ChunkRenderDataSchematic data, EnumSet<OverlayRenderType> overlays)
+    {
+        this.builtOverlays.clear();
+        this.builtOverlays.addAll(overlays);
+        this.compiledData = data;
+    }
+
+    protected void setBuiltContent(@Nullable SchematicPlacementManager.ChunkContent content)
+    {
+        this.builtContent = content;
+    }
+
+    @Nullable
+    protected SchematicPlacementManager.ChunkContent getBuiltContent()
+    {
+        return this.builtContent;
+    }
+
+    @Nullable
+    protected ChunkRenderDataSchematic getCompiledData()
+    {
+        return this.compiledData;
+    }
+
+    protected EnumSet<OverlayRenderType> getBuiltOverlays()
+    {
+        return this.builtOverlays;
+    }
+
     protected ChunkRenderDataSchematic getChunkRenderData()
     {
+        if (this.compiledData != null)
+        {
+            return this.compiledData;
+        }
+
         if (this.chunkRenderData.get() == null || this.chunkRenderData.get().isEmpty())
         {
             this.updateChunkRenderData(this.getRenderChunk().getChunkRenderData());

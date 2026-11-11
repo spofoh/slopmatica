@@ -36,6 +36,7 @@ import net.minecraft.world.phys.Vec3;
 
 import fi.dy.masa.litematica.render.schematic.*;
 import fi.dy.masa.litematica.render.uniform.LegacyTerrainFixUniform;
+import fi.dy.masa.litematica.schematic.placement.SchematicPlacement;
 import fi.dy.masa.litematica.util.invoker.IEntityHitboxDebugRendererInvoker;
 import fi.dy.masa.litematica.world.ChunkSchematicState;
 import fi.dy.masa.litematica.world.WorldSchematic;
@@ -117,6 +118,20 @@ public interface IWorldSchematicRenderer
 	void renderBlockOverlays(Camera camera, float lineWidth, ProfilerFiller profiler);
 
 	void scheduleChunkRenders(int chunkX, int chunkZ, boolean immediate);
+
+	/**
+	 * Fast move preview: the meshes of the given chunks (packed ChunkPos) will be drawn shifted by the preview offset
+	 */
+	default void beginMovePreview(SchematicPlacement placement, List<Long> chunks) {}
+
+	default void onMovePreviewMoved() {}
+
+	/**
+	 * The move got applied to the schematic world; the shifted meshes are kept until their chunks are rebuilt
+	 */
+	default void commitMovePreview() {}
+
+	default void clearMovePreview() {}
 
 	ChunkSchematicState getChunkSchematicState(int chunkX, int chunkZ);
 

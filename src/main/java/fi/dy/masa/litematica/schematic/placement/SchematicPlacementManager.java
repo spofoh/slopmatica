@@ -46,6 +46,7 @@ import fi.dy.masa.litematica.data.EntityDataManager;
 import fi.dy.masa.litematica.data.SchematicHolder;
 import fi.dy.masa.litematica.network.ServuxLitematicaHandler;
 import fi.dy.masa.litematica.network.ServuxLitematicaPacket;
+import fi.dy.masa.litematica.render.LitematicaRenderer;
 import fi.dy.masa.litematica.render.OverlayRenderer;
 import fi.dy.masa.litematica.render.infohud.StatusInfoRenderer;
 import fi.dy.masa.litematica.scheduler.TaskScheduler;
@@ -108,6 +109,187 @@ public class SchematicPlacementManager
     @Nullable
     private SchematicPlacement selectedPlacement;
 
+    // ---- Fast move preview ----
+    // While a placement is being moved, the schematic world is left as-is (no rebuilds),
+    // and the already built chunk meshes are just drawn shifted by the moved amount.
+    // Once the placement stops moving, the change is committed like a normal modification.
+    private static final long MOVE_PREVIEW_COMMIT_DELAY_MS = 350L;
+    @Nullable private volatile SchematicPlacement movePreviewPlacement;
+    private long movePreviewLastMove;
+    private boolean committingMovePreview;
+    private final Set<ChunkPos> movePreviewPreChunks = new HashSet<>();
+    private final Set<Long> movePreviewFrozenChunks = ConcurrentHashMap.newKeySet();
+    private final Set<Long> movePreviewDroppedRebuilds = ConcurrentHashMap.newKeySet();
+    // Which placement (and at what origin) was placed into each schematic world chunk, for chunks with a single placement.
+    // Used to know how far a built mesh has to be shifted during a move preview.
+    private final ConcurrentHashMap<Long, ChunkContent> chunkContents = new ConcurrentHashMap<>(4096, 0.9f, 2);
+
+    public record ChunkContent(SchematicPlacement placement, BlockPos origin) {}
+
+    protected void setChunkContent(int chunkX, int chunkZ, @Nullable ChunkContent content)
+    {
+        if (content != null)
+        {
+            this.chunkContents.put(ChunkPos.pack(chunkX, chunkZ), content);
+        }
+        else
+        {
+            this.chunkContents.remove(ChunkPos.pack(chunkX, chunkZ));
+        }
+    }
+
+    @Nullable
+    public ChunkContent getChunkContent(int chunkX, int chunkZ)
+    {
+        return this.chunkContents.get(ChunkPos.pack(chunkX, chunkZ));
+    }
+
+    /**
+     * Called before the origin of the placement gets changed.
+     * @return true if the move is handled as a preview, and the normal pre/post change handling should be skipped
+     */
+    boolean tryMovePreview(SchematicPlacement placement)
+    {
+        if (this.committingMovePreview)
+        {
+            return false;
+        }
+
+        if (this.movePreviewPlacement == placement)
+        {
+            return true;
+        }
+
+        this.commitMovePreview();
+
+        if (!Configs.Visuals.RENDER_FAST_MOVE_PREVIEW.getBooleanValue() ||
+            !Configs.Visuals.ENABLE_RENDERING.getBooleanValue() ||
+            !placement.isEnabled() || !placement.isRenderingEnabled() ||
+            !this.schematicPlacements.contains(placement))
+        {
+            return false;
+        }
+
+        Set<ChunkPos> chunks = placement.getTouchedChunks(RequiredEnabled.PLACEMENT_ENABLED);
+        List<Long> ghostChunks = new ArrayList<>();
+
+        for (ChunkPos pos : chunks)
+        {
+            // Only chunks that contain nothing but this placement can be shown shifted
+            List<PlacementPart> parts = this.getPlacementPartsInChunk(pos.x(), pos.z());
+            boolean onlyThis = !parts.isEmpty();
+
+            for (PlacementPart part : parts)
+            {
+                if (part.placement != placement)
+                {
+                    onlyThis = false;
+                    break;
+                }
+            }
+
+            if (onlyThis)
+            {
+                ghostChunks.add(pos.pack());
+            }
+
+            this.movePreviewFrozenChunks.add(pos.pack());
+        }
+
+        this.movePreviewPlacement = placement;
+        this.movePreviewPreChunks.clear();
+        this.movePreviewPreChunks.addAll(chunks);
+        LitematicaRenderer.getInstance().getWorldRenderer().beginMovePreview(placement, ghostChunks);
+
+        return true;
+    }
+
+    /**
+     * Called after the origin of the previewed placement was changed
+     */
+    void onMovePreviewMoved(SchematicPlacement placement)
+    {
+        this.movePreviewLastMove = System.currentTimeMillis();
+
+        for (ChunkPos pos : placement.getTouchedChunks(RequiredEnabled.PLACEMENT_ENABLED))
+        {
+            this.movePreviewFrozenChunks.add(pos.pack());
+        }
+
+        LitematicaRenderer.getInstance().getWorldRenderer().onMovePreviewMoved();
+    }
+
+    /**
+     * Applies a pending moved placement to the schematic world (rebuilds the affected chunks)
+     */
+    public void commitMovePreview()
+    {
+        SchematicPlacement placement = this.movePreviewPlacement;
+
+        if (placement == null || this.committingMovePreview)
+        {
+            return;
+        }
+
+        this.committingMovePreview = true;
+
+        try
+        {
+            this.movePreviewPlacement = null;
+            LitematicaRenderer.getInstance().getWorldRenderer().commitMovePreview();
+            this.movePreviewFrozenChunks.clear();
+
+            this.chunksPreChange.clear();
+            this.chunksPreChange.addAll(this.movePreviewPreChunks);
+            this.movePreviewPreChunks.clear();
+            this.onPostPlacementChange(placement);
+            OverlayRenderer.getInstance().updatePlacementCache();
+
+            // Rebuilds of other placements' chunks, that were skipped during the preview
+            for (Long key : this.movePreviewDroppedRebuilds)
+            {
+                this.markChunkForRebuild(ChunkPos.getX(key), ChunkPos.getZ(key));
+            }
+
+            this.movePreviewDroppedRebuilds.clear();
+        }
+        finally
+        {
+            this.committingMovePreview = false;
+        }
+    }
+
+    private void cancelMovePreview()
+    {
+        this.movePreviewPlacement = null;
+        this.movePreviewFrozenChunks.clear();
+        this.movePreviewDroppedRebuilds.clear();
+        this.movePreviewPreChunks.clear();
+        LitematicaRenderer.getInstance().getWorldRenderer().clearMovePreview();
+    }
+
+    /**
+     * Placement Manager threads: the schematic world must not be changed in the chunks of a placement
+     * that is being move-previewed, as it would no longer match the shifted meshes.
+     */
+    protected boolean isChunkFrozenForMovePreview(int chunkX, int chunkZ)
+    {
+        if (this.movePreviewPlacement == null)
+        {
+            return false;
+        }
+
+        final long key = ChunkPos.pack(chunkX, chunkZ);
+
+        if (this.movePreviewFrozenChunks.contains(key))
+        {
+            this.movePreviewDroppedRebuilds.add(key);
+            return true;
+        }
+
+        return false;
+    }
+
     public void setVisibleSubChunksNeedsUpdate()
     {
         this.visibleChunksNeedsUpdate = true;
@@ -152,6 +334,11 @@ public class SchematicPlacementManager
     public void onClientTick(Minecraft mc)
     {
         long now = System.currentTimeMillis();
+
+        if (this.movePreviewPlacement != null && (now - this.movePreviewLastMove) > MOVE_PREVIEW_COMMIT_DELAY_MS)
+        {
+            this.commitMovePreview();
+        }
 
         // Drain tasks every tick.
         if (!this.pendingTasks.isEmpty())
@@ -625,6 +812,8 @@ public class SchematicPlacementManager
 
     protected void addTouchedChunksFor(SchematicPlacement placement)
     {
+        this.commitMovePreview();
+
         Set<ChunkPos> chunks = placement.getTouchedChunks(RequiredEnabled.PLACEMENT_ENABLED);
 
         for (ChunkPos pos : chunks)
@@ -650,6 +839,8 @@ public class SchematicPlacementManager
 
     protected void removeTouchedChunksFor(SchematicPlacement placement)
     {
+        this.commitMovePreview();
+
         Set<ChunkPos> chunks = placement.getTouchedChunks(RequiredEnabled.ANY);
         Set<ChunkPos> toUnload = new HashSet<>();
 
@@ -684,6 +875,8 @@ public class SchematicPlacementManager
 
     void onPrePlacementChange(SchematicPlacement placement)
     {
+        this.commitMovePreview();
+
         this.chunksPreChange.clear();
         this.chunksPreChange.addAll(placement.getTouchedChunks(RequiredEnabled.PLACEMENT_ENABLED));
     }
@@ -855,7 +1048,7 @@ public class SchematicPlacementManager
 
     public void markChunkForRebuild(int cx, int cz)
     {
-        PlacementManagerDaemonHandler.INSTANCE.removeAllTasksFor(cx, cz);
+        // The daemon handler de-duplicates rebuilds per chunk
         PlacementManagerDaemonHandler.INSTANCE.addTask(new PlacementManagerTaskRebuild(this.worldSupplier, cx, cz));
     }
 
@@ -1095,6 +1288,8 @@ public class SchematicPlacementManager
 
     public void pastePlacementToWorld(final SchematicPlacement schematicPlacement, boolean changedBlocksOnly, boolean printMessage, Minecraft mc)
     {
+        this.commitMovePreview();
+
         if (mc.player != null && EntityUtils.isCreativeMode(mc.player))
         {
             if (schematicPlacement != null)
@@ -1191,6 +1386,8 @@ public class SchematicPlacementManager
     {
         // We can safely use endAll() here; but this is mainly for performance reasons
         PlacementManagerDaemonHandler.INSTANCE.reset();
+        this.cancelMovePreview();
+        this.chunkContents.clear();
         this.pendingTasks.clear();
         this.schematicPlacements.clear();
         this.selectedPlacement = null;

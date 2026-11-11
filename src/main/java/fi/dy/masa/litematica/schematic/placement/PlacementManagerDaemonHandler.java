@@ -4,6 +4,7 @@ import java.util.ConcurrentModificationException;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 
 import net.minecraft.client.Minecraft;
@@ -32,6 +33,11 @@ public class PlacementManagerDaemonHandler implements IThreadDaemonHandler<Place
 	private final LinkedBlockingQueue<PlacementManagerTask> queueRebuild = new LinkedBlockingQueue<>();
 	private final LinkedBlockingQueue<PlacementManagerTask> queueOther = new LinkedBlockingQueue<>();
 	private final LinkedBlockingQueue<PlacementManagerTask> deferredQueue = new LinkedBlockingQueue<>();
+	// Chunks with a requested (not yet started) rebuild. A rebuild always uses the current placement state,
+	// so one pending rebuild per chunk is enough. This replaces scanning the (potentially huge) queues
+	// for every chunk whenever a big placement is moved.
+	private final Set<Long> pendingRebuilds = ConcurrentHashMap.newKeySet();
+	private final AtomicInteger deferredOtherCount = new AtomicInteger();
 	private final ReentrantLock lock = new ReentrantLock();
 	private long lastTick;
 	private boolean processing = false;
@@ -252,10 +258,26 @@ public class PlacementManagerDaemonHandler implements IThreadDaemonHandler<Place
 	}
 
 	@Override
-	public synchronized void addTask(PlacementManagerTask newTask)
+	public void addTask(PlacementManagerTask newTask)
+	{
+		if (newTask instanceof PlacementManagerTaskRebuild && !this.pendingRebuilds.add(newTask.asLong()))
+		{
+			// Already queued
+			return;
+		}
+
+		this.enqueueTask(newTask);
+	}
+
+	private synchronized void enqueueTask(PlacementManagerTask newTask)
 	{
 		if (this.checkIfTasksAreFull())
 		{
+			if (!(newTask instanceof PlacementManagerTaskRebuild))
+			{
+				this.deferredOtherCount.incrementAndGet();
+			}
+
 			this.deferredQueue.offer(newTask);
 			return;
 		}
@@ -284,9 +306,15 @@ public class PlacementManagerDaemonHandler implements IThreadDaemonHandler<Place
 	@Override
 	public synchronized PlacementManagerTask getNextTask()
 	{
-		if (!this.queueRebuild.isEmpty())
+		PlacementManagerTask task;
+
+		while ((task = this.queueRebuild.poll()) != null)
 		{
-			return this.queueRebuild.poll();
+			// Skip the ones that were cancelled, or duplicates
+			if (this.pendingRebuilds.remove(task.asLong()))
+			{
+				return task;
+			}
 		}
 
 		if (!this.queueOther.isEmpty())
@@ -345,6 +373,35 @@ public class PlacementManagerDaemonHandler implements IThreadDaemonHandler<Place
 		return false;
 	}
 
+	private int getActiveTaskCap()
+	{
+		final int threadCount = this.threadMap.size();
+		return MathUtils.clamp((threadCount / 2), 1, Math.max(threadCount, 1)) * this.getDeferredCap();
+	}
+
+	/**
+	 * Moves deferred tasks into the active queues as soon as there is room,
+	 * instead of only once everything is done (which only got checked every 1.5 seconds,
+	 * so huge placements loaded in visible batches).
+	 */
+	private synchronized void refillDeferredTasks()
+	{
+		final int free = this.getActiveTaskCap() - (this.queueRebuild.size() + this.queueOther.size());
+		int total = 0;
+		PlacementManagerTask task;
+
+		while (total < free && (task = this.deferredQueue.poll()) != null)
+		{
+			if (!(task instanceof PlacementManagerTaskRebuild))
+			{
+				this.deferredOtherCount.decrementAndGet();
+			}
+
+			this.enqueueTask(task);
+			total++;
+		}
+	}
+
 	private void fillDeferredTasks()
 	{
 		int cap = this.getDeferredCap();
@@ -353,7 +410,12 @@ public class PlacementManagerDaemonHandler implements IThreadDaemonHandler<Place
 
 		while (total < cap && (task = this.deferredQueue.poll()) != null)
 		{
-			this.addTask(task);
+			if (!(task instanceof PlacementManagerTaskRebuild))
+			{
+				this.deferredOtherCount.decrementAndGet();
+			}
+
+			this.enqueueTask(task);
 			total++;
 		}
 	}
@@ -364,6 +426,11 @@ public class PlacementManagerDaemonHandler implements IThreadDaemonHandler<Place
 		if (this.forceStop) { return; }
 		long now = System.currentTimeMillis();
 		if (this.lastTick > now) this.lastTick = now;
+
+		if (!this.deferredQueue.isEmpty())
+		{
+			this.refillDeferredTasks();
+		}
 
 		// Scheduled maintenance tasks
 		if ((now - this.lastTick) > this.getTaskInterval())
@@ -432,7 +499,8 @@ public class PlacementManagerDaemonHandler implements IThreadDaemonHandler<Place
 
 	protected void removeRebuildTasksFor(int x, int z)
 	{
-		this.queueRebuild.removeIf(task -> task.cx() == x && task.cz() == z);
+		// The queued task objects get skipped when polled
+		this.pendingRebuilds.remove(ChunkPos.pack(x, z));
 	}
 
 	protected void removeOtherTasksFor(int x, int z)
@@ -442,7 +510,20 @@ public class PlacementManagerDaemonHandler implements IThreadDaemonHandler<Place
 
 	protected void removeDeferredTasksFor(int x, int z)
 	{
-		this.deferredQueue.removeIf(task -> task.cx() == x && task.cz() == z);
+		// Deferred rebuilds are handled via pendingRebuilds, only scan if there are other deferred tasks
+		if (this.deferredOtherCount.get() > 0)
+		{
+			this.deferredQueue.removeIf(task ->
+			{
+				if (!(task instanceof PlacementManagerTaskRebuild) && task.cx() == x && task.cz() == z)
+				{
+					this.deferredOtherCount.decrementAndGet();
+					return true;
+				}
+
+				return false;
+			});
+		}
 	}
 
 	public boolean hasAnyRebuildTasksFor(ChunkPos pos)
@@ -450,9 +531,9 @@ public class PlacementManagerDaemonHandler implements IThreadDaemonHandler<Place
 		return this.hasAnyRebuildTasksFor(pos.x(), pos.z());
 	}
 
-	public synchronized boolean hasAnyRebuildTasksFor(int cx, int cz)
+	public boolean hasAnyRebuildTasksFor(int cx, int cz)
 	{
-		return this.queueRebuild.stream().anyMatch(task -> (task.cx() == cx && task.cz() == cz));
+		return this.pendingRebuilds.contains(ChunkPos.pack(cx, cz));
 	}
 
 	public synchronized boolean hasAnyOtherTasksFor(int cx, int cz)
@@ -462,7 +543,12 @@ public class PlacementManagerDaemonHandler implements IThreadDaemonHandler<Place
 
 	public synchronized boolean hasAnyDeferredTasksFor(int cx, int cz)
 	{
-		return this.deferredQueue.stream().anyMatch(task -> (task.cx() == cx && task.cz() == cz));
+		if (this.deferredOtherCount.get() <= 0)
+		{
+			return false;
+		}
+
+		return this.deferredQueue.stream().anyMatch(task -> (!(task instanceof PlacementManagerTaskRebuild) && task.cx() == cx && task.cz() == cz));
 	}
 
 	public boolean hasAnyTasks()
@@ -473,7 +559,7 @@ public class PlacementManagerDaemonHandler implements IThreadDaemonHandler<Place
 
 	public boolean hasAnyRebuildTasks()
 	{
-		return !this.queueRebuild.isEmpty();
+		return !this.pendingRebuilds.isEmpty() || !this.queueRebuild.isEmpty();
 	}
 
 	public boolean hasAnyOtherTasks()
@@ -507,6 +593,8 @@ public class PlacementManagerDaemonHandler implements IThreadDaemonHandler<Place
 		{
 			this.queueRebuild.clear();
 		}
+
+		this.pendingRebuilds.clear();
 	}
 
 	protected void removeAllOtherTasks()
@@ -523,13 +611,15 @@ public class PlacementManagerDaemonHandler implements IThreadDaemonHandler<Place
 		{
 			this.deferredQueue.clear();
 		}
+
+		this.deferredOtherCount.set(0);
 	}
 
 	public String getDebugString()
 	{
 		return String.format("T: %02d RB: %03d O: %02d D: %02d",
 		                     this.threadMap.size(),
-		                     this.queueRebuild.size(),
+		                     this.pendingRebuilds.size(),
 		                     this.queueOther.size(),
 		                     this.deferredQueue.size()
 		);

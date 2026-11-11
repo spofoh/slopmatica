@@ -1,7 +1,10 @@
 package fi.dy.masa.litematica.render.schematic;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.PriorityBlockingQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 import com.google.common.collect.Queues;
 import com.google.common.primitives.Doubles;
 import com.google.common.util.concurrent.Futures;
@@ -23,19 +26,113 @@ public class ChunkRenderDispatcherLitematica
 {
     private static final Logger LOGGER = Litematica.LOGGER;
 
+    // Chunk rebuilds (meshing); processed by the background worker threads
     private final PriorityBlockingQueue<ChunkRenderTaskSchematic> queueChunkUpdates;
+    // Translucent re-sorts; processed on the render thread, since they touch the live mesh data
+    private final PriorityBlockingQueue<ChunkRenderTaskSchematic> queueResorts;
     private final Queue<PendingUpload> queueChunkUploads;
 	private final Queue<ChunkRenderDispatcherBuffers> freeBufferPacks;
     private final ChunkRenderWorkerLitematica renderWorker;
-    private Vec3 cameraPos;
+    private final List<Thread> workerThreads = new ArrayList<>();
+    private final AtomicInteger activeWorkerTasks = new AtomicInteger();
+    private volatile boolean running = true;
+    private volatile Vec3 cameraPos;
 
 	protected ChunkRenderDispatcherLitematica()
     {
 		this.queueChunkUpdates = Queues.newPriorityBlockingQueue();
+		this.queueResorts = Queues.newPriorityBlockingQueue();
 		this.queueChunkUploads = Queues.newPriorityQueue();
 	    this.freeBufferPacks = Queues.newConcurrentLinkedQueue();
         this.cameraPos = Vec3.ZERO;
         this.renderWorker = new ChunkRenderWorkerLitematica(this);
+        this.startWorkerThreads();
+    }
+
+    public static int getWorkerThreadCount()
+    {
+        int configured = Configs.Visuals.RENDER_SCHEMATIC_THREADS.getIntegerValue();
+
+        if (configured > 0)
+        {
+            return configured;
+        }
+
+        int cores = Runtime.getRuntime().availableProcessors();
+        return Math.max(1, Math.min(6, (cores - 2) / 3));
+    }
+
+    protected int getWorkerCount()
+    {
+        return this.workerThreads.size();
+    }
+
+    private void startWorkerThreads()
+    {
+        final int count = getWorkerThreadCount();
+
+        for (int i = 0; i < count; i++)
+        {
+            Thread thread = new Thread(this::workerLoop, "Litematica Chunk Builder " + (i + 1));
+            thread.setDaemon(true);
+            thread.setPriority(Math.max(Thread.MIN_PRIORITY, Thread.NORM_PRIORITY - 1));
+            thread.start();
+            this.workerThreads.add(thread);
+        }
+
+        LOGGER.info("Started [{}] schematic chunk builder threads", count);
+    }
+
+    private void workerLoop()
+    {
+        while (this.running)
+        {
+            ChunkRenderTaskSchematic task;
+
+            try
+            {
+                task = this.queueChunkUpdates.take();
+            }
+            catch (InterruptedException e)
+            {
+                continue;
+            }
+
+            this.activeWorkerTasks.incrementAndGet();
+
+            try
+            {
+                this.renderWorker.processTask(task);
+            }
+            catch (InterruptedException ignored)
+            {
+            }
+            catch (Throwable t)
+            {
+                LOGGER.error("Exception while building a schematic chunk mesh: {}", t.toString());
+                task.finish();
+            }
+            finally
+            {
+                this.activeWorkerTasks.decrementAndGet();
+            }
+        }
+    }
+
+    /**
+     * True when no chunk meshes are being built or waiting to be uploaded.
+     */
+    protected boolean isIdle()
+    {
+        synchronized (this.queueChunkUploads)
+        {
+            if (!this.queueChunkUploads.isEmpty())
+            {
+                return false;
+            }
+        }
+
+        return this.queueChunkUpdates.isEmpty() && this.activeWorkerTasks.get() == 0;
     }
 
 	protected ChunkRenderDispatcherBuffers allocateBufferPack()
@@ -62,7 +159,8 @@ public class ChunkRenderDispatcherLitematica
 
     protected String getDebugInfo()
     {
-	    return String.format("pC: %03d, aB: %1d", this.queueChunkUpdates.size(), this.freeBufferPacks.size());
+	    return String.format("pC: %03d, pU: %03d, W: %d/%d, aB: %1d", this.queueChunkUpdates.size(), this.queueChunkUploads.size(),
+	                         this.activeWorkerTasks.get(), this.workerThreads.size(), this.freeBufferPacks.size());
     }
 
     protected boolean runChunkUploads(long finishTimeNano)
@@ -75,7 +173,8 @@ public class ChunkRenderDispatcherLitematica
         {
             boolean processedTask = false;
 
-            ChunkRenderTaskSchematic generator = this.queueChunkUpdates.poll();
+            // Only the translucent resorting runs here, the meshing is done by the worker threads
+            ChunkRenderTaskSchematic generator = this.queueResorts.poll();
 
             if (generator != null)
             {
@@ -127,6 +226,12 @@ public class ChunkRenderDispatcherLitematica
 
         try
         {
+            // Already queued, and it will use the latest world state
+            if (renderChunk.hasPendingRebuild())
+            {
+                return true;
+            }
+
             final ChunkRenderTaskSchematic generator = renderChunk.makeCompileTaskChunkSchematic(this::getCameraPos);
 
             generator.addFinishRunnable(() -> ChunkRenderDispatcherLitematica.this.queueChunkUpdates.remove(generator));
@@ -149,32 +254,40 @@ public class ChunkRenderDispatcherLitematica
         return flag1;
     }
 
+    /**
+     * "Immediate" updates (for example from block changes) are queued
+     * for the worker threads with the highest priority,
+     * instead of building the whole chunk column on the render thread.
+     */
     protected boolean updateChunkNow(ChunkRendererSchematicVbo chunkRenderer)
     {
-//        LOGGER.warn("[Dispatch] updateChunkNow()");
-//        profiler.push("update_chunk_now");
-
         chunkRenderer.getLockCompileTask().lock();
         boolean flag;
 
         try
         {
-            ChunkRenderTaskSchematic generator = chunkRenderer.makeCompileTaskChunkSchematic(this::getCameraPos);
-
-            try
+            // Already queued, and it will use the latest world state
+            if (chunkRenderer.hasPendingRebuild())
             {
-                this.renderWorker.processTask(generator);
+                return true;
             }
-            catch (InterruptedException ignored) { }
 
-            flag = true;
+            final ChunkRenderTaskSchematic generator = chunkRenderer.makeCompileTaskChunkSchematic(this::getCameraPos, true);
+
+            generator.addFinishRunnable(() -> ChunkRenderDispatcherLitematica.this.queueChunkUpdates.remove(generator));
+
+            flag = this.queueChunkUpdates.offer(generator);
+
+            if (!flag)
+            {
+                generator.finish();
+            }
         }
         finally
         {
             chunkRenderer.getLockCompileTask().unlock();
         }
 
-//        profiler.pop();
         return flag;
     }
 
@@ -187,9 +300,19 @@ public class ChunkRenderDispatcherLitematica
 //        profiler.pop();
     }
 
-    protected ChunkRenderTaskSchematic getNextChunkUpdate() throws InterruptedException
+    /**
+     * Queues a task that needs to run on the render thread, ordered with the uploads.
+     */
+    protected ListenableFuture<Object> scheduleOnRenderThread(Runnable runnable, final double distanceSq)
     {
-        return this.queueChunkUpdates.take();
+        ListenableFutureTask<Object> futureTask = ListenableFutureTask.create(runnable, null);
+
+        synchronized (this.queueChunkUploads)
+        {
+            this.queueChunkUploads.add(new PendingUpload(futureTask, distanceSq));
+        }
+
+        return futureTask;
     }
 
     protected boolean updateTransparencyLater(ChunkRendererSchematicVbo renderChunk)
@@ -210,9 +333,9 @@ public class ChunkRenderDispatcherLitematica
                 return flag;
             }
 
-            generator.addFinishRunnable(() -> ChunkRenderDispatcherLitematica.this.queueChunkUpdates.remove(generator));
+            generator.addFinishRunnable(() -> ChunkRenderDispatcherLitematica.this.queueResorts.remove(generator));
 
-            flag = this.queueChunkUpdates.offer(generator);
+            flag = this.queueResorts.offer(generator);
         }
         finally
         {
@@ -456,7 +579,8 @@ public class ChunkRenderDispatcherLitematica
     {
         while (this.queueChunkUpdates.isEmpty() == false)
         {
-            ChunkRenderTaskSchematic generator = this.queueChunkUpdates.poll();
+            // Only the translucent resorting runs here, the meshing is done by the worker threads
+            ChunkRenderTaskSchematic generator = this.queueResorts.poll();
 
             if (generator != null)
             {
@@ -473,7 +597,15 @@ public class ChunkRenderDispatcherLitematica
     protected void stopWorkerThreads()
     {
 //        LOGGER.warn("[Dispatch] stopWorkerThreads()");
+        this.running = false;
         this.clearChunkUpdates();
+
+        for (Thread thread : this.workerThreads)
+        {
+            thread.interrupt();
+        }
+
+        this.workerThreads.clear();
     }
 
     protected static class PendingUpload implements Comparable<PendingUpload>

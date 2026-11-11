@@ -42,7 +42,8 @@ import fi.dy.masa.litematica.mixin.render.IMixinGameRenderer;
 public class BlockModelCacheSchematic
 {
 	public static final BlockModelCacheSchematic INSTANCE = new BlockModelCacheSchematic();
-	private static final SingleThreadedRandomSource RAND = new SingleThreadedRandomSource(0L);
+	// Per thread, since the meshes are built on multiple worker threads (seeded per block for the model variants)
+	private static final ThreadLocal<SingleThreadedRandomSource> RAND = ThreadLocal.withInitial(() -> new SingleThreadedRandomSource(0L));
 	private static final Matrix4fc MATRIX = new Matrix4f();
 	private final ConcurrentHashMap<BlockState, BlockStateModel> blockStateModelCache;
 	private final ConcurrentHashMap<BlockState, BlockModel> blockModelCache;
@@ -73,7 +74,7 @@ public class BlockModelCacheSchematic
 
 	protected RandomSource rand()
 	{
-		return RAND;
+		return RAND.get();
 	}
 
 	protected ModelManager modelManager()
@@ -280,7 +281,7 @@ public class BlockModelCacheSchematic
 	public List<BlockStateModelPart> getBlockStateModelParts(BlockStateModel model)
 	{
 		List<BlockStateModelPart> parts = new ArrayList<>();
-		model.collectParts(RAND, parts);
+		model.collectParts(RAND.get(), parts);
 		return parts;
 	}
 

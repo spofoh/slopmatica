@@ -140,104 +140,30 @@ public class ChunkRenderGpuUploader
 	protected void uploadBuffersByLayer(ChunkSectionLayer layer, @Nonnull MeshData meshData, boolean useResorting)
 	{
 //        LOGGER.warn("[GPU] uploadBuffersByLayer() Layer [{}], IndexCount [{}]", layer.label(), meshData.drawState().indexCount());
-		ChunkRenderGpuBuffers gpuBuffers = this.buffersOrNull(layer);
-//		boolean useResorting = Configs.Visuals.RENDER_ENABLE_TRANSLUCENT_RESORTING.getBooleanValue();
+		// Always upload into new buffers; the old ones get closed by saveBuffers() once replaced.
+		// (Reusing them closed the buffers without replacing them, making chunks disappear after a rebuild)
 		GpuDevice device = RenderSystem.getDevice();
-
-		if (gpuBuffers != null)
-		{
-			if (gpuBuffers.vertexBuffer != null)
-			{
-				gpuBuffers.vertexBuffer.close();
-			}
-
-			if (gpuBuffers.indexBuffer != null)
-			{
-				gpuBuffers.indexBuffer.close();
-				gpuBuffers.indexBuffer = null;
-			}
-
-			CommandEncoder encoder = device.createCommandEncoder();
-
-			if (gpuBuffers.vertexBuffer.size() < meshData.vertexBuffer().remaining())
-			{
-//                LOGGER.warn("[GPU] uploadBuffersByLayer() Layer [{}], --> RESIZE / NEW BUFFER", layer.label());
-				gpuBuffers.vertexBuffer.close();
-				gpuBuffers.setVertexBuffer(
-						device.createBuffer(
-								() -> "VertexBuffer: " + gpuBuffers.getName() + " VBO Section: [" + this.chunkRelativePos.toShortString() + "]",
-								40, meshData.vertexBuffer()
-						));
-			}
-			else if (!gpuBuffers.vertexBuffer.isClosed())
-			{
-//                LOGGER.warn("[GPU] uploadBuffersByLayer() Layer [{}], --> WRITE BUFFER", layer.label());
-				encoder.writeToBuffer(gpuBuffers.vertexBuffer.slice(), meshData.vertexBuffer());
-			}
-
-			// Resorting
-			if (meshData.indexBuffer() != null && useResorting)
-			{
-//                LOGGER.warn("[GPU] uploadBuffersByLayer() Layer [{}], RESORTING", layer.label());
-
-				if (gpuBuffers.indexBuffer != null && gpuBuffers.indexBuffer.size() >= meshData.indexBuffer().remaining())
-				{
-					if (!gpuBuffers.indexBuffer.isClosed())
-					{
-//                        LOGGER.warn("[GPU] uploadBuffersByLayer() Layer [{}], RESORTING --> WRITE BUFFER", layer.label());
-						encoder.writeToBuffer(gpuBuffers.indexBuffer.slice(), meshData.indexBuffer());
-					}
-				}
-				else
-				{
-					if (gpuBuffers.indexBuffer != null)
-					{
-						gpuBuffers.indexBuffer.close();
-					}
-
-//                    LOGGER.warn("[GPU] uploadBuffersByLayer() Layer [{}], RESORTING --> CREATE/SET INDEX BUFFER", layer.label());
-					gpuBuffers.setIndexBuffer(
-							device.createBuffer(
-									() -> "SortedBuffer: " + gpuBuffers.getName() + " VBO Section: [" + this.chunkRelativePos.toShortString() + "]",
-									72, meshData.indexBuffer()
-							));
-				}
-			}
-			else if (gpuBuffers.indexBuffer != null)
-			{
-				gpuBuffers.indexBuffer.close();
-//                LOGGER.warn("[GPU] uploadBuffersByLayer() Layer [{}], ELSE --> CLEAR INDEX BUFFER", layer.label());
-				gpuBuffers.setIndexBuffer(null);
-			}
-
-//            LOGGER.warn("[GPU] uploadBuffersByLayer() Layer [{}], INDEX COUNT/TYPE --> SAVE", layer.label());
-			gpuBuffers.setIndexCount(meshData.drawState().indexCount());
-			gpuBuffers.setIndexType(meshData.drawState().indexType());
-            this.gpuBufferCache.saveBuffers(layer, gpuBuffers);
-		}
-		else
-		{
-			Supplier<String> name = layer::label;
+		Supplier<String> name = layer::label;
 //            LOGGER.warn("[GPU] uploadBuffersByLayer() Layer [{}], NEW VERTEX BUFFER", layer.label());
-			GpuBuffer vertexBuffer =
-					device.createBuffer(
-							() -> "VertexBuffer: " + name.get() + " VBO Section: [" + this.chunkRelativePos.toShortString() + "]",
-							40, meshData.vertexBuffer()
-					);
-			GpuBuffer indexBuffer =
-					meshData.indexBuffer() != null && useResorting ?
-					device.createBuffer(
-							() -> "IndexBuffer: " + name.get() + " VBO Section: [" + this.chunkRelativePos.toShortString() + "]",
-							72, meshData.indexBuffer()
-					) : null;
+		GpuBuffer vertexBuffer =
+				device.createBuffer(
+						() -> "VertexBuffer: " + name.get() + " VBO Section: [" + this.chunkRelativePos.toShortString() + "]",
+						40, meshData.vertexBuffer()
+				);
+		GpuBuffer indexBuffer =
+				meshData.indexBuffer() != null && useResorting ?
+				device.createBuffer(
+						() -> "IndexBuffer: " + name.get() + " VBO Section: [" + this.chunkRelativePos.toShortString() + "]",
+						72, meshData.indexBuffer()
+				) : null;
 
 //            LOGGER.warn("[GPU] uploadBuffersByLayer() Layer [{}], NEW VERTEX BUFFER --> SAVE", layer.label());
-			this.gpuBufferCache.saveBuffers(layer,
-			                                new ChunkRenderGpuBuffers(name, vertexBuffer, indexBuffer,
-			                                                          meshData.drawState().indexCount(),
-			                                                          meshData.drawState().indexType())
-			);
-		}
+		this.gpuBufferCache.saveBuffers(layer,
+		                                new ChunkRenderGpuBuffers(name, vertexBuffer, indexBuffer,
+		                                                          meshData.drawState().indexCount(),
+		                                                          meshData.drawState().indexType())
+		);
+
 
 //        LOGGER.warn("[GPU] uploadBuffersByLayer() Layer [{}], END", layer.label());
         meshData.close();
@@ -246,105 +172,30 @@ public class ChunkRenderGpuUploader
 	protected void uploadBuffersByType(OverlayRenderType type, @Nonnull MeshData meshData, boolean useResorting)
 	{
 //        LOGGER.warn("[GPU] uploadBuffersByType() Overlay [{}], IndexCount [{}]", type.name(), meshData.drawState().indexCount());
-		ChunkRenderGpuBuffers gpuBuffers = this.buffersOrNull(type);
-//        boolean useResorting = Configs.Visuals.SCHEMATIC_OVERLAY_ENABLE_RESORTING.getBooleanValue();
+		// Always upload into new buffers; the old ones get closed by saveBuffers() once replaced.
+		// (Reusing them closed the buffers without replacing them, making chunks disappear after a rebuild)
 		GpuDevice device = RenderSystem.getDevice();
-
-		if (gpuBuffers != null)
-		{
-			if (gpuBuffers.vertexBuffer != null)
-			{
-				gpuBuffers.vertexBuffer.close();
-			}
-
-			if (gpuBuffers.indexBuffer != null)
-			{
-				gpuBuffers.indexBuffer.close();
-				gpuBuffers.indexBuffer = null;
-			}
-
-			CommandEncoder encoder = device.createCommandEncoder();
-
-			if (gpuBuffers.vertexBuffer.size() < meshData.vertexBuffer().remaining())
-			{
-//                LOGGER.warn("[GPU] uploadBuffersByType() Overlay [{}], --> RESIZE / NEW BUFFER", type.name());
-				gpuBuffers.vertexBuffer.close();
-				gpuBuffers.setVertexBuffer(
-						device.createBuffer(
-								() -> "VertexBuffer: Overlay/" + gpuBuffers.getName() + " VBO Section: [" + this.chunkRelativePos.toShortString() + "]",
-								40, meshData.vertexBuffer()
-						));
-			}
-			else if (!gpuBuffers.vertexBuffer.isClosed())
-			{
-//                LOGGER.warn("[GPU] uploadBuffersByType() Overlay [{}], --> WRITE BUFFER", type.name());
-				encoder.writeToBuffer(gpuBuffers.vertexBuffer.slice(), meshData.vertexBuffer());
-			}
-
-			// Resorting
-            if (meshData.indexBuffer() != null && useResorting)
-            {
-//                LOGGER.warn("[GPU] uploadBuffersByType() Overlay [{}], RESORTING", type.name());
-
-                if (gpuBuffers.indexBuffer != null && gpuBuffers.indexBuffer.size() >= meshData.indexBuffer().remaining())
-                {
-                    if (!gpuBuffers.indexBuffer.isClosed())
-                    {
-//                        LOGGER.warn("[GPU] uploadBuffersByType() Overlay [{}], RESORTING --> WRITE BUFFER", type.name());
-                        encoder.writeToBuffer(gpuBuffers.indexBuffer.slice(), meshData.indexBuffer());
-                    }
-                }
-                else
-                {
-                    if (gpuBuffers.indexBuffer != null)
-                    {
-                        gpuBuffers.indexBuffer.close();
-                    }
-
-//                    LOGGER.warn("[GPU] uploadBuffersByType() Overlay [{}], RESORTING --> CREATE/SET INDEX BUFFER", type.name());
-                    gpuBuffers.setIndexBuffer(
-                            RenderSystem.getDevice()
-                                        .createBuffer(() -> "SortedBuffer: Overlay/" + gpuBuffers.getName() + " VBO Section: [" + this.chunkRelativePos.toShortString() + "]",
-                                                      72, meshData.indexBuffer())
-                    );
-                }
-            }
-            else
-			if (gpuBuffers.indexBuffer != null)
-			{
-//                LOGGER.warn("[GPU] uploadBuffersByType() Overlay [{}], ELSE --> CLEAR INDEX BUFFER", type.name());
-				gpuBuffers.indexBuffer.close();
-				gpuBuffers.setIndexBuffer(null);
-			}
-
-//            LOGGER.warn("[GPU] uploadBuffersByType() Overlay [{}], INDEX COUNT/TYPE --> SAVE", type.name());
-			gpuBuffers.setIndexCount(meshData.drawState().indexCount());
-			gpuBuffers.setIndexType(meshData.drawState().indexType());
-            this.gpuBufferCache.saveBuffers(type, gpuBuffers);
-		}
-		else
-		{
-			Supplier<String> name = type::name;
+		Supplier<String> name = type::name;
 //            LOGGER.warn("[GPU] uploadBuffersByType() Overlay [{}], NEW VERTEX BUFFER", type.name());
-			GpuBuffer vertexBuffer =
-					device.createBuffer(
-							() -> "VertexBuffer: Overlay/" + name.get() + " VBO Section: [" + this.chunkRelativePos.toShortString() + "]",
-							40, meshData.vertexBuffer()
-					);
-			GpuBuffer indexBuffer =
-					meshData.indexBuffer() != null && useResorting ?
+		GpuBuffer vertexBuffer =
+				device.createBuffer(
+						() -> "VertexBuffer: Overlay/" + name.get() + " VBO Section: [" + this.chunkRelativePos.toShortString() + "]",
+						40, meshData.vertexBuffer()
+				);
+		GpuBuffer indexBuffer =
+				meshData.indexBuffer() != null && useResorting ?
                     RenderSystem.getDevice()
                                 .createBuffer(() -> "IndexBuffer: " + name.get() + " VBO Section: [" + this.chunkRelativePos.toShortString() + "]",
                                               72, meshData.indexBuffer()
                                 ) : null;
 
 //            LOGGER.warn("[GPU] uploadBuffersByType() Overlay [{}], NEW VERTEX BUFFER --> SAVE", type.name());
-			this.gpuBufferCache.saveBuffers(type,
-			                                new ChunkRenderGpuBuffers(name, vertexBuffer, indexBuffer,
-			                                                          meshData.drawState().indexCount(),
-			                                                          meshData.drawState().indexType())
-			);
-		}
+		this.gpuBufferCache.saveBuffers(type,
+		                                new ChunkRenderGpuBuffers(name, vertexBuffer, indexBuffer,
+		                                                          meshData.drawState().indexCount(),
+		                                                          meshData.drawState().indexType())
+		);
+
 
 //        LOGGER.warn("[GPU] uploadBuffersByType() Overlay [{}], END", type.name());
         meshData.close();

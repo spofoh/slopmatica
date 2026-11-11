@@ -875,6 +875,17 @@ public class SchematicPlacement
 
         if (this.origin.equals(origin) == false)
         {
+            // Fast move preview: the schematic world gets rebuilt only once the placement stops moving
+            if (this.placementManager.tryMovePreview(this))
+            {
+                this.origin = origin;
+                ((SchematicPlacementEventHandler) SchematicPlacementEventHandler.getInstance()).onSetOrigin(this, origin);
+                this.updateEnclosingBox();
+                this.placementManager.onMovePreviewMoved(this);
+                OverlayRenderer.getInstance().updatePlacementCache();
+                return this;
+            }
+
             // Marks the currently touched chunks before doing the modification
             this.placementManager.onPrePlacementChange(this);
 

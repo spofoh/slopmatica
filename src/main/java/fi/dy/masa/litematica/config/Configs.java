@@ -253,7 +253,8 @@ public class Configs implements IConfigHandler
         public static final ConfigBooleanHotkeyed ENABLE_SCHEMATIC_RENDERING        = new ConfigBooleanHotkeyed("enableSchematicRendering", true, "").apply(VISUALS_KEY);
         public static final ConfigBooleanHotkeyed ENABLE_SCHEMATIC_ENTITY_HITBOXES  = new ConfigBooleanHotkeyed("enableSchematicEntityHitboxes", true, "").apply(VISUALS_KEY);
         public static final ConfigBooleanHotkeyed ENABLE_SCHEMATIC_FAKE_LIGHTING    = new ConfigBooleanHotkeyed("enableSchematicFakeLighting", true, "").apply(VISUALS_KEY);
-        //public static final ConfigInteger       RENDER_SCHEMATIC_MAX_THREADS        = new ConfigInteger("renderSchematicMaxThreads", 4, 1, 16).apply(VISUALS_KEY);
+        public static final ConfigInteger       RENDER_SCHEMATIC_THREADS            = new ConfigInteger("renderSchematicThreads", 0, 0, 16).apply(VISUALS_KEY);
+        public static final ConfigBoolean       RENDER_FAST_MOVE_PREVIEW            = new ConfigBoolean("renderFastMovePreview", true).apply(VISUALS_KEY);
         public static final ConfigDouble        GHOST_BLOCK_ALPHA                   = new ConfigDouble( "ghostBlockAlpha", 0.5, 0, 1).apply(VISUALS_KEY);
         public static final ConfigBoolean       IGNORE_EXISTING_FLUIDS              = new ConfigBoolean("ignoreExistingFluids", false).apply(VISUALS_KEY);
         public static final ConfigBoolean       IGNORE_EXISTING_BLOCKS              = new ConfigBoolean("ignoreExistingBlocks", false).apply(VISUALS_KEY);
@@ -317,6 +318,8 @@ public class Configs implements IConfigHandler
                 RENDER_PLACEMENT_BOX_SIDES,
                 RENDER_PLACEMENT_ENCLOSING_BOX,
                 RENDER_PLACEMENT_ENCLOSING_BOX_SIDES,
+                RENDER_FAST_MOVE_PREVIEW,
+                RENDER_SCHEMATIC_THREADS,
                 RENDER_SCHEMATIC_ENTITIES,
                 RENDER_SCHEMATIC_TILE_ENTITIES,
                 RENDER_TRANSLUCENT_INNER_SIDES,

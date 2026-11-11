@@ -66,28 +66,44 @@ public class ChunkRenderWorkerLitematica
         else
         {
             ChunkRenderTaskSchematic.Type taskType = task.getType();
-	        ChunkRenderDispatcherBuffers pack = this.chunkRenderDispatcher.allocateBufferPack();
             ChunkPos cp = task.getChunkPos();
-            ChunkRenderGpuUploader uploader = LitematicaRenderer.getInstance()
-                                                                .getWorldRenderer()
-                                                                .getChunkRendererGpuDispatcher()
-                                                                .addOrGetUploader(cp.x(), cp.z());
+            ChunkRenderGpuDispatcher gpuDispatcher = LitematicaRenderer.getInstance()
+                                                                       .getWorldRenderer()
+                                                                       .getChunkRendererGpuDispatcher();
 
-//            profiler.popPush("run_task_now_" + taskType.name());
-            if (taskType == ChunkRenderTaskSchematic.Type.REBUILD_CHUNK)
+            if (gpuDispatcher == null)
             {
-//                LOGGER.warn("[LW] (REBUILD_CHUNK) --> [VBO]");
-                if (!uploader.isEmpty())
-                {
-                    uploader.clear();
-                }
-
-                task.getRenderChunk().rebuildChunk(task, pack);
+                task.finish();
+                return;
             }
-            else if (taskType == ChunkRenderTaskSchematic.Type.RESORT_TRANSPARENCY)
+
+            ChunkRenderGpuUploader uploader = gpuDispatcher.addOrGetUploader(cp.x(), cp.z());
+
+            if (uploader == null)
             {
-//                LOGGER.warn("[LW] (RESORT_TRANSPARENCY) --> [VBO]");
-                task.getRenderChunk().resortTransparency(task, pack);
+                task.finish();
+                return;
+            }
+
+	        ChunkRenderDispatcherBuffers pack = this.chunkRenderDispatcher.allocateBufferPack();
+
+            try
+            {
+                if (taskType == ChunkRenderTaskSchematic.Type.REBUILD_CHUNK)
+                {
+                    // The old GPU buffers are kept until the new ones get uploaded (no flickering),
+                    // and the unused ones get closed on the render thread once the new data is in place.
+                    task.getRenderChunk().rebuildChunk(task, pack);
+                }
+                else if (taskType == ChunkRenderTaskSchematic.Type.RESORT_TRANSPARENCY)
+                {
+                    task.getRenderChunk().resortTransparency(task, pack);
+                }
+            }
+            catch (Throwable t)
+            {
+                this.chunkRenderDispatcher.freeBufferPack(pack);
+                throw t;
             }
 
             task.getLock().lock();
@@ -101,6 +117,15 @@ public class ChunkRenderWorkerLitematica
                         LOGGER.warn("Chunk render task was {} when I expected it to be compiling; aborting task", (Object) task.getStatus());
                     }
 
+                    // Superseded by a newer task; throw away the result
+                    ChunkRenderDataSchematic compiled = task.getCompiledData();
+
+                    if (taskType == ChunkRenderTaskSchematic.Type.REBUILD_CHUNK && compiled != null)
+                    {
+                        compiled.clearAll();
+                    }
+
+                    this.chunkRenderDispatcher.freeBufferPack(pack);
 //                    profiler.pop();
                     return;
                 }
@@ -167,6 +192,13 @@ public class ChunkRenderWorkerLitematica
                 }
             }
 
+            if (taskType == ChunkRenderTaskSchematic.Type.REBUILD_CHUNK)
+            {
+                // Always finish a rebuild on the render thread, even if it has nothing to upload.
+                // This keeps all the changes to the live render data and GPU buffers on one thread.
+                futuresList.add(this.chunkRenderDispatcher.scheduleOnRenderThread(() -> uploader.gpuBufferCache().closeUnused(compiledChunk), task.getDistanceSq()));
+            }
+
 //            LOGGER.error("[LW] processTask() POST // compiledChunk DUMP -->");
 //            compiledChunk.dumpRenderDataDebug();
 //            profiler.popPush("run_task_later_" + taskType.name());
@@ -212,18 +244,36 @@ public class ChunkRenderWorkerLitematica
                             task.getLock().unlock();
                         }
 
+                        // Superseded; the new data was never swapped in, so free it
+                        if (task.getType() == ChunkRenderTaskSchematic.Type.REBUILD_CHUNK)
+                        {
+                            compiledChunk.clearAll();
+                        }
+
                         return;
                     }
 
 //                    LOGGER.warn("[LW] procesTask() --> futureCallback onSuccess() --> UPDATE");
 //                    compiledChunk.dumpRenderDataDebug();
-                    task.getRenderChunk().updateChunkRenderData(compiledChunk);
+                    if (task.getType() == ChunkRenderTaskSchematic.Type.REBUILD_CHUNK)
+                    {
+                        task.getRenderChunk().onRebuildUploaded(task, compiledChunk);
+                    }
+                    else
+                    {
+                        task.getRenderChunk().updateChunkRenderData(compiledChunk);
+                    }
                 }
 
                 @Override
                 public void onFailure(@NotNull Throwable throwable)
                 {
 	                ChunkRenderWorkerLitematica.this.chunkRenderDispatcher.freeBufferPack(pack);
+
+                    if (task.getType() == ChunkRenderTaskSchematic.Type.REBUILD_CHUNK)
+                    {
+                        compiledChunk.clearAll();
+                    }
 
                     if ((throwable instanceof CancellationException) == false && (throwable instanceof InterruptedException) == false)
                     {

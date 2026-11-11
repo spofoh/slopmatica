@@ -107,6 +107,35 @@ public class GpuBufferCache implements AutoCloseable
         this.overlayBuffers.clear();
     }
 
+    /**
+     * Closes the buffers of layers/types that the new chunk data no longer uses.
+     * Render thread only.
+     */
+    protected void closeUnused(ChunkRenderDataSchematic data)
+    {
+        this.blockBuffers.entrySet().removeIf(entry ->
+        {
+            if (data.isBlockLayerEmpty(entry.getKey()))
+            {
+                try { entry.getValue().close(); } catch (Exception ignored) { }
+                return true;
+            }
+
+            return false;
+        });
+
+        this.overlayBuffers.entrySet().removeIf(entry ->
+        {
+            if (data.isOverlayTypeEmpty(entry.getKey()))
+            {
+                try { entry.getValue().close(); } catch (Exception ignored) { }
+                return true;
+            }
+
+            return false;
+        });
+    }
+
     protected boolean isEmpty()
     {
         return this.blockBuffers.isEmpty() && this.overlayBuffers.isEmpty();

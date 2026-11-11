@@ -27,6 +27,7 @@ import net.minecraft.core.Direction;
 import net.minecraft.core.Vec3i;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.util.RandomSource;
+import net.minecraft.util.profiling.InactiveProfiler;
 import net.minecraft.util.profiling.ProfilerFiller;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.ChunkPos;
@@ -51,6 +52,7 @@ import fi.dy.masa.litematica.config.Configs;
 import fi.dy.masa.litematica.data.DataManager;
 import fi.dy.masa.litematica.render.IWorldSchematicRenderer;
 import fi.dy.masa.litematica.render.RenderUtils;
+import fi.dy.masa.litematica.schematic.placement.SchematicPlacementManager;
 import fi.dy.masa.litematica.schematic.placement.SchematicPlacementManager.PlacementPart;
 import fi.dy.masa.litematica.util.IgnoreBlockRegistry;
 import fi.dy.masa.litematica.util.OverlayType;
@@ -75,6 +77,13 @@ public class ChunkRendererSchematicVbo implements AutoCloseable
 
 	protected final List<IntBoundingBox> boxes;
 	protected final EnumSet<OverlayRenderType> existingOverlays;
+	// Overlay state of the mesh currently being built (worker thread), swapped in once uploaded
+	private final EnumSet<OverlayRenderType> compileOverlays;
+	private boolean compileHasOverlay;
+	// Move preview: while set, this renderer is drawn shifted by the difference between the placement's
+	// current origin and the origin its mesh was built for (meshContent)
+	private volatile boolean ghost;
+	@Nullable private volatile SchematicPlacementManager.ChunkContent meshContent;
 
 	private AABB boundingBox;
 	protected Color4f overlayColor;
@@ -104,7 +113,55 @@ public class ChunkRendererSchematicVbo implements AutoCloseable
 		this.chunkRelativePos = new BlockPos.MutableBlockPos();
 		this.boxes = new ArrayList<>();
 		this.existingOverlays = EnumSet.noneOf(OverlayRenderType.class);
+		this.compileOverlays = EnumSet.noneOf(OverlayRenderType.class);
 		this.hasOverlay = false;
+	}
+
+	public boolean isGhost()
+	{
+		return this.ghost;
+	}
+
+	protected void setGhost(boolean ghost)
+	{
+		this.ghost = ghost;
+	}
+
+	/**
+	 * Which placement, and at which origin, the currently uploaded mesh was built from
+	 */
+	@Nullable
+	protected SchematicPlacementManager.ChunkContent getMeshContent()
+	{
+		return this.meshContent;
+	}
+
+	/**
+	 * Render thread. Swaps in the freshly built mesh data, after its buffers have been uploaded.
+	 */
+	protected void onRebuildUploaded(ChunkRenderTaskSchematic task, ChunkRenderDataSchematic data)
+	{
+		this.chunkRenderDataLock.lock();
+
+		try
+		{
+			ChunkRenderDataSchematic old = this.chunkRenderData;
+			this.chunkRenderData = data;
+
+			if (old != null && old != data)
+			{
+				old.clearAll();
+			}
+
+			this.existingOverlays.clear();
+			this.existingOverlays.addAll(task.getBuiltOverlays());
+			this.hasOverlay = !this.existingOverlays.isEmpty();
+			this.meshContent = task.getBuiltContent();
+		}
+		finally
+		{
+			this.chunkRenderDataLock.unlock();
+		}
 	}
 
 	public boolean hasOverlay()
@@ -119,6 +176,12 @@ public class ChunkRendererSchematicVbo implements AutoCloseable
 
 	protected ProfilerFiller getProfiler()
 	{
+		// The profiler is not thread safe, and the meshing runs on the worker threads
+		if (!RenderSystem.isOnRenderThread())
+		{
+			return InactiveProfiler.INSTANCE;
+		}
+
 		if (this.profiler == null)
 		{
 			this.profiler = this.worldRenderer.getProfiler();
@@ -345,12 +408,8 @@ public class ChunkRendererSchematicVbo implements AutoCloseable
 				return;
 			}
 
-			if (task.getChunkRenderData() != null)
-			{
-				task.getChunkRenderData().clearAll();
-			}
-
-			task.updateChunkRenderData(data);
+			// Note: the live render data of this chunk is left untouched here (it is still being drawn),
+			// the new data replaces it on the render thread once it's uploaded.
 		}
 		finally
 		{
@@ -371,12 +430,24 @@ public class ChunkRendererSchematicVbo implements AutoCloseable
 
 		chunkMeshData.clearTileCache();
 
-		this.existingOverlays.clear();
-		this.hasOverlay = false;
 		this.getProfiler().popPush("rebuild_chunk_start");
 
+		// Only one mesh build at a time per chunk; also guards the world views and the boxes
 		synchronized (this.boxes)
 		{
+			if (task.isFinished())
+			{
+				// Superseded while waiting
+				this.getProfiler().pop();
+				return;
+			}
+
+			ChunkPos cpos = this.getChunkPos();
+			task.setBuiltContent(DataManager.getSchematicPlacementManager().getChunkContent(cpos.x(), cpos.z()));
+			this.rebuildWorldView();
+			this.compileOverlays.clear();
+			this.compileHasOverlay = false;
+			boolean aborted = false;
 			int minX = posChunk.getX();
 			int minY = posChunk.getY();
 			int minZ = posChunk.getZ();
@@ -437,6 +508,7 @@ public class ChunkRendererSchematicVbo implements AutoCloseable
 				blockRenderer.reload();
 				blockRenderer.enableCache();
 
+				outer:
 				for (IntBoundingBox box : this.boxes)
 				{
 					box = range.getClampedRenderBoundingBox(box);
@@ -450,8 +522,18 @@ public class ChunkRendererSchematicVbo implements AutoCloseable
 					BlockPos posFrom = new BlockPos(box.minX(), box.minY(), box.minZ());
 					BlockPos posTo = new BlockPos(box.maxX(), box.maxY(), box.maxZ());
 
+					int counter = 0;
+
 					for (BlockPos posMutable : BlockPos.MutableBlockPos.betweenClosed(posFrom, posTo))
 					{
+						// A newer build for this chunk was requested (for example the placement moved again),
+						// stop wasting time on this one.
+						if ((++counter & 1023) == 0 && task.isFinished())
+						{
+							aborted = true;
+							break outer;
+						}
+
 						// Fluid models and the overlay use the VertexConsumer#vertex(x, y, z) method.
 						// Fluid rendering and the overlay do not use the MatrixStack.
 						// Block models use the VertexConsumer#quad() method, and they use the MatrixStack.
@@ -461,6 +543,16 @@ public class ChunkRendererSchematicVbo implements AutoCloseable
 				}
 
 				blockRenderer.disableCache();
+
+				if (aborted)
+				{
+					pack.builderCache().clearAll();
+					data.clearAll();
+					chunkMeshData.clearAll();
+					this.getProfiler().pop();
+					return;
+				}
+
 				Set<ChunkSectionLayer> usedBlockLayers = new HashSet<>();
 
 				this.getProfiler().popPush("rebuild_chunk_layers");
@@ -481,11 +573,11 @@ public class ChunkRendererSchematicVbo implements AutoCloseable
 					}
 				}
 
-				if (this.hasOverlay)
+				if (this.compileHasOverlay)
 				{
 					this.getProfiler().popPush("rebuild_chunk_overlays");
 					//if (GuiBase.isCtrlDown()) System.out.printf("postRenderOverlays\n");
-					for (OverlayRenderType type : this.existingOverlays)
+					for (OverlayRenderType type : this.compileOverlays)
 					{
 						if (data.isOverlayTypeStarted(type))
 						{
@@ -504,7 +596,7 @@ public class ChunkRendererSchematicVbo implements AutoCloseable
 
 				chunkMeshData.updateVisibility(visGraph);
 				chunkMeshData.compileLayerDrawStates(usedBlockLayers);
-				chunkMeshData.compileOverlayDrawStates(this.existingOverlays);
+				chunkMeshData.compileOverlayDrawStates(this.compileOverlays);
 			}
 		}
 
@@ -532,13 +624,16 @@ public class ChunkRendererSchematicVbo implements AutoCloseable
 		}
 		finally
 		{
-			this.updateChunkRenderData(data);
+			// The data is swapped in on the render thread once the buffers are uploaded (onRebuildUploaded)
+			task.setCompiledData(data, this.compileOverlays);
 			this.chunkRenderDataLock.unlock();
 		}
 
-		if (this.worldRenderer.getChunkSchematicState(this.chunkPosition.x(), this.chunkPosition.z()).atLeast(ChunkSchematicState.RENDERED))
+		ChunkPos cp = this.getChunkPos();
+
+		if (this.worldRenderer.getChunkSchematicState(cp.x(), cp.z()).atLeast(ChunkSchematicState.RENDERED))
 		{
-			this.worldRenderer.setChunkSchematicState(this.chunkPosition.x(), this.chunkPosition.z(), ChunkSchematicState.RENDERED);
+			this.worldRenderer.setChunkSchematicState(cp.x(), cp.z(), ChunkSchematicState.RENDERED);
 		}
 	}
 
@@ -1160,8 +1255,14 @@ public class ChunkRendererSchematicVbo implements AutoCloseable
 
 			if (te != null)
 			{
-				this.schematicWorldView.world.getChunkAt(pos).addAndRegisterBlockEntity(te);
-				this.schematicWorldView.addBlockEntity(pos, te);
+				LevelChunk chunk = this.schematicWorldView.world.getChunkAt(pos);
+
+				// Neighboring chunk builds may run at the same time on other threads
+				synchronized (chunk)
+				{
+					chunk.addAndRegisterBlockEntity(te);
+					this.schematicWorldView.addBlockEntity(pos, te);
+				}
 			}
 		}
 
@@ -1195,8 +1296,8 @@ public class ChunkRendererSchematicVbo implements AutoCloseable
 
 	private BufferBuilder preRenderOverlay(ChunkRenderDispatcherBuffers pack, OverlayRenderType type)
 	{
-		this.existingOverlays.add(type);
-		this.hasOverlay = true;
+		this.compileOverlays.add(type);
+		this.compileHasOverlay = true;
 		return pack.getBuilder(type);
 	}
 
@@ -1461,6 +1562,11 @@ public class ChunkRendererSchematicVbo implements AutoCloseable
 
 	protected ChunkRenderTaskSchematic makeCompileTaskChunkSchematic(Supplier<Vec3> cameraPosSupplier)
 	{
+		return this.makeCompileTaskChunkSchematic(cameraPosSupplier, false);
+	}
+
+	protected ChunkRenderTaskSchematic makeCompileTaskChunkSchematic(Supplier<Vec3> cameraPosSupplier, boolean immediate)
+	{
 //        LOGGER.warn("[VBO] makeCompileTaskChunkSchematic()");
 		this.chunkRenderLock.lock();
 		ChunkRenderTaskSchematic generator;
@@ -1468,9 +1574,9 @@ public class ChunkRendererSchematicVbo implements AutoCloseable
 		try
 		{
 			//if (GuiBase.isCtrlDown()) System.out.printf("makeCompileTaskChunk()\n");
+			// Supersedes (and aborts) any older build; the world view is created by the worker thread
 			this.finishCompileTask();
-			this.rebuildWorldView();
-			this.compileTask = new ChunkRenderTaskSchematic(this, ChunkRenderTaskSchematic.Type.REBUILD_CHUNK, cameraPosSupplier, this.getDistanceSq());
+			this.compileTask = new ChunkRenderTaskSchematic(this, ChunkRenderTaskSchematic.Type.REBUILD_CHUNK, cameraPosSupplier, immediate ? -1.0 : this.getDistanceSq());
 			generator = this.compileTask;
 		}
 		finally
@@ -1489,12 +1595,9 @@ public class ChunkRendererSchematicVbo implements AutoCloseable
 
 		try
 		{
-			if (this.compileTask == null || this.compileTask.getStatus() != ChunkRenderTaskSchematic.Status.PENDING)
+			// A rebuild is still pending or in progress, it will produce freshly sorted data anyway
+			if (this.compileTask == null || this.compileTask.getStatus() == ChunkRenderTaskSchematic.Status.DONE)
 			{
-				if (this.compileTask != null && this.compileTask.getStatus() != ChunkRenderTaskSchematic.Status.DONE)
-				{
-					this.compileTask.finish();
-				}
 
 				if (!this.chunkRenderData.isEmpty())
 				{
@@ -1515,6 +1618,35 @@ public class ChunkRendererSchematicVbo implements AutoCloseable
 		}
 
 		return null;
+	}
+
+	/**
+	 * A rebuild that is waiting for a worker thread. It reads the current world state once it starts,
+	 * so a newer change does not need a new task.
+	 */
+	protected boolean hasPendingRebuild()
+	{
+		ChunkRenderTaskSchematic task = this.compileTask;
+		return task != null && task.getType() == ChunkRenderTaskSchematic.Type.REBUILD_CHUNK &&
+		       task.getStatus() == ChunkRenderTaskSchematic.Status.PENDING && !task.isFinished();
+	}
+
+	/**
+	 * A rebuild that is being meshed or uploaded right now. Instead of aborting it (which,
+	 * with constant block changes like while pasting, would never let it finish),
+	 * a newer change waits for it, and gets rebuilt right after.
+	 */
+	protected boolean isRebuildInFlight()
+	{
+		ChunkRenderTaskSchematic task = this.compileTask;
+
+		if (task == null || task.getType() != ChunkRenderTaskSchematic.Type.REBUILD_CHUNK || task.isFinished())
+		{
+			return false;
+		}
+
+		ChunkRenderTaskSchematic.Status status = task.getStatus();
+		return status == ChunkRenderTaskSchematic.Status.COMPILING || status == ChunkRenderTaskSchematic.Status.UPLOADING;
 	}
 
 	protected void finishCompileTask()

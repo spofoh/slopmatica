@@ -52,6 +52,7 @@ import net.minecraft.util.RandomSource;
 import net.minecraft.util.Util;
 import net.minecraft.util.debug.DebugValueAccess;
 import net.minecraft.util.profiling.Profiler;
+import net.minecraft.util.profiling.InactiveProfiler;
 import net.minecraft.util.profiling.ProfilerFiller;
 import net.minecraft.world.entity.Avatar;
 import net.minecraft.world.entity.Entity;
@@ -90,6 +91,9 @@ import fi.dy.masa.litematica.config.Hotkeys;
 import fi.dy.masa.litematica.data.DataManager;
 import fi.dy.masa.litematica.mixin.entity.IMixinEntity;
 import fi.dy.masa.litematica.render.IWorldSchematicRenderer;
+import fi.dy.masa.litematica.schematic.placement.SchematicPlacementManager;
+import fi.dy.masa.litematica.schematic.placement.SchematicPlacement;
+import fi.dy.masa.litematica.schematic.placement.PlacementManagerDaemonHandler;
 import fi.dy.masa.litematica.render.uniform.LegacyTerrainFixUniform;
 import fi.dy.masa.litematica.util.invoker.IAvatarInvoker;
 import fi.dy.masa.litematica.util.invoker.IEntityHitboxDebugRendererInvoker;
@@ -135,6 +139,15 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
     private double lastTranslucentSortZ;
     private boolean needsUpdate;
     private boolean shouldDraw;
+
+    // Fast move preview ("ghost" chunks that are drawn shifted, see SchematicPlacementManager#tryMovePreview)
+    private static final long GHOST_SETTLE_NANOS = 300_000_000L;
+    private static final long GHOST_TIMEOUT_NANOS = 15_000_000_000L;
+    private final List<ChunkRendererSchematicVbo> ghostRenderers = new ArrayList<>();
+    @Nullable private SchematicPlacement ghostPlacement;
+    private boolean ghostPreviewActive;
+    private long ghostCommitNanos;
+    private long ghostLastBusyNanos;
 
     public WorldRendererSchematic(Minecraft mc)
     {
@@ -217,6 +230,12 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
     @Override
     public ProfilerFiller getProfiler()
     {
+        // Called from the chunk builder threads too; the profiler is not thread safe
+        if (!RenderSystem.isOnRenderThread())
+        {
+            return InactiveProfiler.INSTANCE;
+        }
+
         if (this.profiler == null)
         {
             this.profiler = Profiler.get();
@@ -319,6 +338,7 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
         }
         else
         {
+            this.clearMovePreview();
             this.chunksToUpdate.forEach(ChunkRendererSchematicVbo::deleteGlResources);
             this.chunksToUpdate.clear();
             this.renderInfos.forEach(ChunkRendererSchematicVbo::deleteGlResources);
@@ -371,6 +391,14 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
 
             profiler.push("load_renderers");
 
+            // Re-create the builder threads if the configured thread count changed
+            if (this.renderDispatcher != null &&
+                this.renderDispatcher.getWorkerCount() != ChunkRenderDispatcherLitematica.getWorkerThreadCount())
+            {
+                this.renderDispatcher.stopWorkerThreads();
+                this.renderDispatcher = null;
+            }
+
             if (this.renderDispatcher == null)
             {
                 this.renderDispatcher = new ChunkRenderDispatcherLitematica();
@@ -392,6 +420,7 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
 
             this.stopChunkUpdates(profiler);
 			this.clearWorldRenderStates();
+            this.clearMovePreview();
 
             BlockModelCacheSchematic.INSTANCE.onLoadRenderers();
 
@@ -485,6 +514,7 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
         this.lastCameraYaw = camera.yRot();
 
         profiler.popPush("update");
+        this.updateMovePreview();
 
         if (this.needsUpdate)
         {
@@ -512,7 +542,15 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
                 {
                     ChunkRendererSchematicVbo chunkRenderer = this.chunkRendererDispatcher.getChunkRenderer(cx, cz);
 
-                    if (chunkRenderer != null && frustum.isVisible(chunkRenderer.getBoundingBox()))
+                    // Shifted (move preview) chunks are added below; but still let them rebuild when needed
+                    if (chunkRenderer != null && chunkRenderer.isGhost())
+                    {
+                        if (chunkRenderer.needsUpdate())
+                        {
+                            this.chunksToUpdate.add(chunkRenderer);
+                        }
+                    }
+                    else if (chunkRenderer != null && frustum.isVisible(chunkRenderer.getBoundingBox()))
                     {
                         //if (GuiBase.isCtrlDown()) System.out.printf("add @ %s\n", subChunk);
                         if (chunkRenderer.needsUpdate() && chunkPos.equals(viewChunk))
@@ -525,6 +563,25 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
                 }
 
                 count++;
+            }
+
+            if (!this.ghostRenderers.isEmpty())
+            {
+                for (ChunkRendererSchematicVbo ghost : this.ghostRenderers)
+                {
+                    if (!ghost.isGhost())
+                    {
+                        continue;
+                    }
+
+                    BlockPos shift = this.getGhostShift(ghost);
+                    AABB bb = shift != null ? ghost.getBoundingBox().move(shift.getX(), shift.getY(), shift.getZ()) : ghost.getBoundingBox();
+
+                    if (frustum.isVisible(bb))
+                    {
+                        this.renderInfos.add(ghost);
+                    }
+                }
             }
 
             profiler.pop(); // fetch (update_sort)
@@ -542,7 +599,8 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
                 BlockPos pos = chunkRendererTmp.getOrigin().offset(8, 8, 8);
                 boolean isNear = pos.distSqr(viewPos) < 1024.0D;
 
-                if (!chunkRendererTmp.needsImmediateUpdate() && !isNear)
+                // Let a running build finish first, it gets rebuilt right after (see updateChunks())
+                if (chunkRendererTmp.isRebuildInFlight() || (!chunkRendererTmp.needsImmediateUpdate() && !isNear))
                 {
 //                    LOGGER.warn("[WorldRenderer] setupTerrain --> Update Later @ cp: {}", chunkRendererTmp.getChunkPos().toString());
                     this.chunksToUpdate.add(chunkRendererTmp);
@@ -599,6 +657,12 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
                 ChunkRendererSchematicVbo renderChunk = iterator.next();
                 boolean flag;
                 boolean immediate = renderChunk.needsImmediateUpdate();
+
+                // Still being built from an older state; rebuild once that is done
+                if (renderChunk.isRebuildInFlight())
+                {
+                    continue;
+                }
 
                 if (immediate)
                 {
@@ -713,7 +777,8 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
             final ChunkRendererSchematicVbo renderer = this.renderInfos.get(i);
             final ChunkRenderDataSchematic data = renderer.getChunkRenderData();
             final ChunkMeshDataSchematic chunkMeshData = data.getMeshDataCache();
-            final BlockPos chunkOrigin = renderer.getOrigin();
+            final BlockPos.MutableBlockPos chunkOrigin = new BlockPos.MutableBlockPos();
+            this.offsetForGhost(renderer, chunkOrigin);
             final ChunkPos chunkPos = renderer.getChunkPos();
             final ChunkRenderGpuUploader gpuUploader = this.chunkRendererGpuDispatcher.addOrGetUploader(chunkPos.x(), chunkPos.z());
 //            long now = System.currentTimeMillis();
@@ -1013,7 +1078,8 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
             {
                 final ChunkRenderDataSchematic compiledChunk = renderer.getChunkRenderData();
                 final ChunkMeshDataSchematic chunkMeshData = compiledChunk.getMeshDataCache();
-                final BlockPos chunkOrigin = renderer.getOrigin();
+                final BlockPos.MutableBlockPos chunkOrigin = new BlockPos.MutableBlockPos();
+                this.offsetForGhost(renderer, chunkOrigin);
                 final ChunkPos cp = renderer.getChunkPos();
                 ChunkRenderGpuUploader gpuUploader = this.chunkRendererGpuDispatcher.addOrGetUploader(cp.x(), cp.z());
 
@@ -1081,6 +1147,7 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
             {
                 renderer.setYOffset(offsetY);
                 renderer.tesselate(world, pos, output, blockState, fluidState);
+                this.getProfiler().pop();
 
                 return true;
             }
@@ -1434,6 +1501,12 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
         profiler.popPush("block_entities_iteration");
         for (ChunkRendererSchematicVbo chunkRenderer : this.renderInfos)
         {
+            // Block entities aren't shifted during a move preview
+            if (chunkRenderer.isGhost())
+            {
+                continue;
+            }
+
             final ChunkPos chunkPos = chunkRenderer.getChunkPos();
             ChunkSchematic chunk = this.world.getChunkSource().getChunkForLighting(chunkPos.x(), chunkPos.z());
 
@@ -1585,6 +1658,162 @@ public class WorldRendererSchematic implements IWorldSchematicRenderer
             Configs.Visuals.ENABLE_SCHEMATIC_RENDERING.getBooleanValue())
         {
             this.chunkRendererDispatcher.scheduleChunkRender(chunkX, chunkZ, immediate);
+        }
+    }
+
+    @Override
+    public void beginMovePreview(SchematicPlacement placement, List<Long> chunks)
+    {
+        // Moving the same placement again while the previous move is still being rebuilt:
+        // keep the still shifted chunks, they know which origin their mesh is from.
+        if (this.ghostPlacement != placement)
+        {
+            this.clearMovePreview();
+        }
+
+        if (this.chunkRendererDispatcher == null)
+        {
+            return;
+        }
+
+        for (Long key : chunks)
+        {
+            ChunkRendererSchematicVbo renderer = this.chunkRendererDispatcher.chunkRenderers.get(key);
+
+            if (renderer != null && !renderer.isGhost())
+            {
+                renderer.setGhost(true);
+                this.ghostRenderers.add(renderer);
+            }
+        }
+
+        this.ghostPlacement = placement;
+        this.ghostPreviewActive = true;
+        this.ghostCommitNanos = 0L;
+        this.needsUpdate = true;
+    }
+
+    @Override
+    public void onMovePreviewMoved()
+    {
+        this.needsUpdate = true;
+    }
+
+    @Override
+    public void commitMovePreview()
+    {
+        this.ghostPreviewActive = false;
+        this.ghostCommitNanos = System.nanoTime();
+        this.ghostLastBusyNanos = this.ghostCommitNanos;
+        this.needsUpdate = true;
+    }
+
+    @Override
+    public void clearMovePreview()
+    {
+        for (ChunkRendererSchematicVbo renderer : this.ghostRenderers)
+        {
+            renderer.setGhost(false);
+        }
+
+        this.ghostRenderers.clear();
+        this.ghostPlacement = null;
+        this.ghostPreviewActive = false;
+        this.ghostCommitNanos = 0L;
+        this.needsUpdate = true;
+    }
+
+    /**
+     * After a committed move, the shifted meshes are kept until the chunks have been rebuilt,
+     * so that the placement doesn't disappear or jump back while the rebuild is in progress.
+     */
+    private void updateMovePreview()
+    {
+        if (this.ghostRenderers.isEmpty())
+        {
+            if (this.ghostPlacement != null && !this.ghostPreviewActive)
+            {
+                this.clearMovePreview();
+            }
+
+            return;
+        }
+
+        if (!this.ghostPreviewActive)
+        {
+            final long now = System.nanoTime();
+
+            // Rebuilt for the current origin -> no longer needs shifting
+            this.ghostRenderers.removeIf(r ->
+            {
+                if (this.getGhostShift(r) == null)
+                {
+                    r.setGhost(false);
+                    return true;
+                }
+
+                return false;
+            });
+
+            boolean busy = !this.chunksToUpdate.isEmpty() ||
+                           (this.renderDispatcher != null && !this.renderDispatcher.isIdle()) ||
+                           PlacementManagerDaemonHandler.INSTANCE.hasAnyRebuildTasks() ||
+                           PlacementManagerDaemonHandler.INSTANCE.hasAnyDeferredTasks();
+
+            if (busy)
+            {
+                this.ghostLastBusyNanos = now;
+            }
+
+            if (this.ghostRenderers.isEmpty() ||
+                (now - this.ghostLastBusyNanos) > GHOST_SETTLE_NANOS ||
+                (now - this.ghostCommitNanos) > GHOST_TIMEOUT_NANOS)
+            {
+                this.clearMovePreview();
+                return;
+            }
+        }
+
+        // Keep the visible list up to date while there are shifted chunks
+        this.needsUpdate = true;
+    }
+
+    /**
+     * @return how much the mesh of this (preview) chunk has to be shifted, or null if not at all
+     */
+    @Nullable
+    private BlockPos getGhostShift(ChunkRendererSchematicVbo renderer)
+    {
+        SchematicPlacement placement = this.ghostPlacement;
+        SchematicPlacementManager.ChunkContent content = renderer.getMeshContent();
+
+        if (placement == null || content == null || content.placement() != placement)
+        {
+            return null;
+        }
+
+        BlockPos origin = placement.getOrigin();
+
+        if (origin.equals(content.origin()))
+        {
+            return null;
+        }
+
+        return origin.subtract(content.origin());
+    }
+
+    private void offsetForGhost(ChunkRendererSchematicVbo renderer, BlockPos.MutableBlockPos out)
+    {
+        BlockPos origin = renderer.getOrigin();
+        BlockPos shift = renderer.isGhost() ? this.getGhostShift(renderer) : null;
+
+        if (shift != null)
+        {
+            out.set(origin.getX() + shift.getX(), origin.getY() + shift.getY(), origin.getZ() + shift.getZ());
+        }
+        else
+        {
+            out.set(origin);
         }
     }
 

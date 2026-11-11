@@ -5,6 +5,7 @@ import java.util.function.Supplier;
 
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.core.BlockPos;
 
 import fi.dy.masa.litematica.data.DataManager;
 import fi.dy.masa.litematica.util.WorldPlacingUtils;
@@ -44,6 +45,12 @@ public class PlacementManagerTaskRebuild extends PlacementManagerTask
 				return;
 			}
 
+			// The placement in this chunk is being moved (preview); it gets rebuilt once the move is committed
+			if (manager.isChunkFrozenForMovePreview(this.cx(), this.cz()))
+			{
+				return;
+			}
+
 			if (manager.getAllSchematicsTouchingChunk(this.pos()).isEmpty())
 			{
 //				manager.removePendingRebuildFor(this.pos());
@@ -75,13 +82,26 @@ public class PlacementManagerTaskRebuild extends PlacementManagerTask
 
 				if (!placements.isEmpty())
 				{
+					SchematicPlacement single = null;
+					BlockPos singleOrigin = null;
+					int count = 0;
+
 					for (SchematicPlacement placement : placements)
 					{
 						if (placement.isEnabled())
 						{
+							if (count++ == 0)
+							{
+								single = placement;
+								singleOrigin = placement.getOrigin();
+							}
+
 							WorldPlacingUtils.placeToProtoChunk(protoChunk, this.pos(), placement);
 						}
 					}
+
+					// Remember what got placed here, for the move preview
+					manager.setChunkContent(this.cx(), this.cz(), count == 1 ? new SchematicPlacementManager.ChunkContent(single, singleOrigin) : null);
 
 					// Load Real Chunk and spawn the entities
 					worldSchematic.unloadEntitiesByChunk(this.cx(), this.cz());
@@ -91,8 +111,8 @@ public class PlacementManagerTaskRebuild extends PlacementManagerTask
 
 				protoChunk.clear();
 
-//				PlacementManagerDaemonHandler.INSTANCE.removeUnloadTasksFor(this.cx(), this.cz());
-				PlacementManagerDaemonHandler.INSTANCE.removeRebuildTasksFor(this.cx(), this.cz());
+				// Note: a rebuild requested while this one was running is kept,
+				// since it may have been requested for a newer placement state.
 
 				worldSchematic.scheduleChunkRenders(this.cx(), this.cz());
 				manager.setVisibleSubChunksNeedsUpdate();

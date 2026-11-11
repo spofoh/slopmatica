@@ -33,16 +33,13 @@ public class ChunkRenderGpuDispatcher
 
 		try
 		{
-			if (!this.uploaders.containsKey(index))
+			// computeIfAbsent, so that worker threads can't race and create two uploaders
+			return this.uploaders.computeIfAbsent(index, k ->
 			{
 				ChunkRenderGpuUploader uploader = new ChunkRenderGpuUploader(this.world, this.renderer);
-
 				uploader.setPosition(cx << 4, this.world.getMinY(), cz << 4);
-
-				this.uploaders.put(index, uploader);
-			}
-
-			return this.uploaders.get(index);
+				return uploader;
+			});
 		}
 		catch (Exception e)
 		{

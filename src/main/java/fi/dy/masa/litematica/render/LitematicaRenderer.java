@@ -106,13 +106,16 @@ public class LitematicaRenderer
         // TODO 1.15+
         long fpsTarget = 60L;
 
+        // The meshing runs on the worker threads now, so this only limits the GPU uploads
+        // done on the render thread per frame. An unlimited budget would freeze the game
+        // for a moment when lots of chunks finish at once (like when moving a big placement).
         if (Configs.Generic.RENDER_THREAD_NO_TIMEOUT.getBooleanValue())
         {
-            this.finishTimeNano = Long.MAX_VALUE;
+            this.finishTimeNano = System.nanoTime() + 1000000000L / fpsTarget / 2L;
         }
         else
         {
-            this.finishTimeNano = System.nanoTime() + 1000000000L / fpsTarget / 2L;
+            this.finishTimeNano = System.nanoTime() + 1000000000L / fpsTarget / 4L;
         }
     }
 
